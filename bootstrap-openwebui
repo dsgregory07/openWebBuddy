@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+#
+# bootstrap-openwebui — one-time OpenWebUI configuration after first signup.
+#
+#   ./bootstrap-openwebui <openwebui-api-key>
+#
+# On a fresh machine, ./setup seeds most OpenWebUI settings via env vars, but
+# pinning the Net-Diag tool server to the model requires an authenticated API
+# call — and no API key can exist until the admin account does. So, once:
+# open the chat, create the admin account, generate an API key under
+# Settings → Account → API keys, then run this script with that key.
+#
+# Safe to re-run; it detects already-applied state.
+#
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OWUI_URL="http://localhost:3000"
+
+if [[ -t 1 ]]; then
+  BLU=$'\033[34m'; GRN=$'\033[32m'; RED=$'\033[31m'; RST=$'\033[0m'
+else
+  BLU=""; GRN=""; RED=""; RST=""
+fi
+step() { printf "%s==>%s %s\n" "$BLU" "$RST" "$*"; }
+ok()   { printf "  %s✓%s %s\n" "$GRN" "$RST" "$*"; }
+die()  { printf "  %s✗%s %s\n" "$RED" "$RST" "$*" >&2; exit 1; }
+
+KEY="${1:-}"
+[[ -n "$KEY" ]] || die "usage: ./bootstrap-openwebui <openwebui-api-key>  (create one under Settings → Account → API keys after admin signup)"
+
+# Same source of truth as ./setup: the MODEL line in the launcher.
+MODEL="$(grep -m1 '^MODEL=' "$ROOT/openWebBuddy" 2>/dev/null | cut -d'"' -f2 || true)"
+MODEL="${MODEL:-llama3.2:1b}"
+
+AUTH=(-H "Authorization: Bearer $KEY" -H "Content-Type: application/json")
+
+step "OpenWebUI at $OWUI_URL"
+curl -sf --max-time 5 "$OWUI_URL/health" >/dev/null \
+  || die "OpenWebUI is not reachable — start it first (./openWebBuddy)"
+ok "reachable"
+
+step "Pinning Net-Diag tools to model $MODEL"
+payload="$(cat <<JSON
+{"id":"$MODEL","base_model_id":null,"name":"$MODEL","meta":{"profile_image_url":"/static/favicon.png","description":null,"capabilities":{"vision":false,"file_upload":true,"web_search":false,"image_generation":false,"code_interpreter":false,"citations":true},"suggestion_prompts":null,"tags":[],"toolIds":["server:Server"]},"params":{},"access_control":null,"is_active":true}
+JSON
+)"
+resp="$(curl -s "${AUTH[@]}" -X POST -d "$payload" "$OWUI_URL/api/v1/models/create" || true)"
+if grep -qi 'taken\|already exist' <<<"$resp"; then
+  ok "model record already exists — leaving it as is"
+elif grep -q "\"id\":\"$MODEL\"" <<<"$resp"; then
+  ok "model record created with Net-Diag tools pinned"
+else
+  die "models/create failed: ${resp:-no response} (bad API key?)"
+fi
+
+step "Setting default model to $MODEL"
+curl -s "${AUTH[@]}" -X POST -d "{\"config\":{\"ui.default_models\":\"$MODEL\"}}" \
+  "$OWUI_URL/api/v1/configs/import" >/dev/null \
+  || die "configs/import failed"
+ok "submitted"
+
+step "Verifying"
+FAIL=0
+tool_ids="$(curl -s "${AUTH[@]}" "$OWUI_URL/api/v1/models/model?id=$MODEL" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(",".join(d.get("meta",{}).get("toolIds") or []))' 2>/dev/null || true)"
+if [[ "$tool_ids" == *"server:Server"* ]]; then
+  ok "tools pinned to $MODEL (toolIds: $tool_ids)"
+else
+  printf "  %s✗%s tool pinning not confirmed (got: '%s')\n" "$RED" "$RST" "$tool_ids" >&2
+  FAIL=1
+fi
+default_model="$(curl -s "${AUTH[@]}" "$OWUI_URL/api/v1/configs/export" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ui.default_models",""))' 2>/dev/null || true)"
+if [[ "$default_model" == "$MODEL" ]]; then
+  ok "default model is $MODEL"
+else
+  printf "  %s✗%s default model not confirmed (got: '%s')\n" "$RED" "$RST" "$default_model" >&2
+  FAIL=1
+fi
+
+echo
+if (( FAIL )); then
+  printf "%s✗ Bootstrap incomplete — see errors above.%s\n" "$RED" "$RST"
+  exit 1
+fi
+printf "%s✓ OpenWebUI configured — open %s and start chatting.%s\n" "$GRN" "$OWUI_URL" "$RST"

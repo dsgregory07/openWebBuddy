@@ -1,0 +1,10 @@
+# Claude Code local settings — contains API keys; must never be committed
+.claude/
+
+# Runtime state
+logs/
+
+# Python
+net-mcp/.venv/
+__pycache__/
+*.pyc

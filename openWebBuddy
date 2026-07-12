@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+#
+# openWebBuddy — one-command launcher for the offline Network Troubleshooting Assistant.
+#
+#   ./openWebBuddy           start Ollama + OpenWebUI + the net-diag MCP tool bridge,
+#                            then open a browser to the chat UI
+#   ./openWebBuddy stop      stop the MCP bridge, OpenWebUI, and Ollama
+#   ./openWebBuddy status    show what's running (exit 1 if anything is down)
+#   ./openWebBuddy restart   stop then start
+#
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "openWebBuddy is Linux-only for now — macOS is not supported yet" \
+       "(most diagnostic tools require Linux networking commands)." >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MCP_DIR="$ROOT/net-mcp"
+PY="$MCP_DIR/.venv/bin/python"
+MCPO="$MCP_DIR/.venv/bin/mcpo"
+SERVER="$MCP_DIR/net_mcp_server.py"
+
+LOG_DIR="$ROOT/logs"
+MCPO_LOG="$LOG_DIR/mcpo.log"
+MCPO_PIDFILE="$LOG_DIR/mcpo.pid"
+
+OLLAMA_SERVICE="ollama"
+OLLAMA_URL="http://localhost:11434"
+MODEL="llama3.2:1b"
+
+OWUI_CONTAINER="open-webui"
+OWUI_PORT="3000"
+OWUI_URL="http://localhost:${OWUI_PORT}"
+
+MCPO_PORT="8000"
+
+# ---------------------------------------------------------------------------
+# Pretty output
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  BLU=$'\033[34m'; GRN=$'\033[32m'; YLW=$'\033[33m'; RED=$'\033[31m'; DIM=$'\033[2m'; RST=$'\033[0m'
+else
+  BLU=""; GRN=""; YLW=""; RED=""; DIM=""; RST=""
+fi
+step() { printf "%s==>%s %s\n" "$BLU" "$RST" "$*"; }
+ok()   { printf "  %s✓%s %s\n" "$GRN" "$RST" "$*"; }
+warn() { printf "  %s!%s %s\n" "$YLW" "$RST" "$*"; }
+die()  { printf "  %s✗%s %s\n" "$RED" "$RST" "$*" >&2; exit 1; }
+
+# Wait until `cmd` succeeds, up to $2 seconds.
+wait_for() {
+  local cmd="$1" timeout="$2" elapsed=0
+  while ! eval "$cmd" >/dev/null 2>&1; do
+    sleep 1; elapsed=$((elapsed + 1))
+    if (( elapsed >= timeout )); then
+      return 1
+    fi
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Component: Ollama
+# ---------------------------------------------------------------------------
+start_ollama() {
+  step "Ollama model server"
+  if curl -sf "${OLLAMA_URL}/api/tags" >/dev/null 2>&1; then
+    ok "already running"
+  else
+    sudo -n systemctl start "$OLLAMA_SERVICE" || die "could not start ollama (need passwordless sudo for systemctl — run ./setup)"
+    wait_for "curl -sf ${OLLAMA_URL}/api/tags" 30 || die "ollama did not come up within 30s"
+    ok "started"
+  fi
+  # -F: the tag contains regex metachars; plain grep (not -q) drains the pipe,
+  # avoiding a SIGPIPE/pipefail race turning a real match into a false miss.
+  if curl -sf "${OLLAMA_URL}/api/tags" | grep -F "\"${MODEL}\"" >/dev/null; then
+    ok "model ${MODEL} available"
+  else
+    warn "model ${MODEL} not found — pull it with: ollama pull ${MODEL}"
+  fi
+}
+
+stop_ollama() {
+  step "Ollama model server"
+  if systemctl is-active --quiet "$OLLAMA_SERVICE"; then
+    sudo -n systemctl stop "$OLLAMA_SERVICE" && ok "stopped" || warn "could not stop ollama"
+  else
+    ok "already stopped"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Component: OpenWebUI (Docker)
+# ---------------------------------------------------------------------------
+start_owui() {
+  step "OpenWebUI"
+  if [[ "$(docker inspect -f '{{.State.Running}}' "$OWUI_CONTAINER" 2>/dev/null)" == "true" ]]; then
+    ok "already running"
+  else
+    docker start "$OWUI_CONTAINER" >/dev/null \
+      || die "could not start container '${OWUI_CONTAINER}' (run ./setup; note: Ollama stays up — ./openWebBuddy stop rolls back)"
+    ok "container started"
+  fi
+  wait_for "curl -sf ${OWUI_URL}/health" 60 \
+    || wait_for "curl -sf ${OWUI_URL}" 60 \
+    || die "OpenWebUI did not become reachable on ${OWUI_URL} (Ollama stays up — ./openWebBuddy stop rolls back)"
+  ok "reachable at ${OWUI_URL}"
+}
+
+stop_owui() {
+  step "OpenWebUI"
+  if [[ "$(docker inspect -f '{{.State.Running}}' "$OWUI_CONTAINER" 2>/dev/null)" == "true" ]]; then
+    docker stop "$OWUI_CONTAINER" >/dev/null && ok "stopped" || warn "could not stop container"
+  else
+    ok "already stopped"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Component: net-diag MCP bridge (mcpo -> OpenAPI tool server)
+# ---------------------------------------------------------------------------
+start_mcpo() {
+  step "net-diag tool bridge (mcpo)"
+  if curl -sf "http://localhost:${MCPO_PORT}/openapi.json" >/dev/null 2>&1; then
+    ok "already running on :${MCPO_PORT}"
+    return
+  fi
+  mkdir -p "$LOG_DIR"
+  nohup "$MCPO" --port "$MCPO_PORT" --host 0.0.0.0 \
+      -n "net-diag" \
+      -d "Offline network diagnostic tools (ping, traceroute, DNS, ARP, port scan, router audit)" \
+      -- "$PY" "$SERVER" \
+      >"$MCPO_LOG" 2>&1 &
+  echo $! >"$MCPO_PIDFILE"
+  wait_for "curl -sf http://localhost:${MCPO_PORT}/openapi.json" 20 \
+    || die "mcpo did not come up — see ${MCPO_LOG} (Ollama/OpenWebUI stay up — ./openWebBuddy stop rolls back)"
+  local n
+  n=$(curl -sf "http://localhost:${MCPO_PORT}/openapi.json" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["paths"]))' 2>/dev/null || echo "?")
+  ok "serving ${n} tools on :${MCPO_PORT}"
+}
+
+stop_mcpo() {
+  step "net-diag tool bridge (mcpo)"
+  local stopped=0 pid
+  # Only kill the recorded PID if it still belongs to mcpo — PIDs get recycled
+  # across reboots and a stale pidfile must not take out an innocent process.
+  if [[ -f "$MCPO_PIDFILE" ]]; then
+    pid="$(cat "$MCPO_PIDFILE")"
+    if ps -p "$pid" -o args= 2>/dev/null | grep -F mcpo >/dev/null; then
+      kill "$pid" 2>/dev/null && stopped=1
+    fi
+  fi
+  # Belt and suspenders: kill anything still bound to the mcpo command.
+  pkill -f "mcpo --port ${MCPO_PORT}" 2>/dev/null && stopped=1 || true
+  rm -f "$MCPO_PIDFILE"
+  (( stopped )) && ok "stopped" || ok "already stopped"
+}
+
+# ---------------------------------------------------------------------------
+# Browser
+# ---------------------------------------------------------------------------
+open_browser() {
+  step "Opening chat"
+  if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && command -v xdg-open >/dev/null 2>&1; then
+    nohup xdg-open "$OWUI_URL" >/dev/null 2>&1 &
+    ok "launched browser at ${OWUI_URL}"
+  else
+    warn "no desktop session detected — open ${OWUI_URL} in a browser"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_start() {
+  start_ollama
+  start_owui
+  start_mcpo
+  open_browser
+  echo
+  printf "%s✓ openWebBuddy is up.%s\n" "$GRN" "$RST"
+  printf "%s  Chat:   %s%s\n" "$DIM" "$OWUI_URL" "$RST"
+  printf "%s  Tools:  http://localhost:%s (net-diag OpenAPI server)%s\n" "$DIM" "$MCPO_PORT" "$RST"
+  printf "%s  Stop with: %s/openWebBuddy stop%s\n" "$DIM" "$ROOT" "$RST"
+}
+
+cmd_stop() {
+  stop_mcpo
+  stop_owui
+  stop_ollama
+  echo
+  printf "%s✓ All components stopped.%s\n" "$GRN" "$RST"
+}
+
+cmd_status() {
+  step "Status"
+  local down=0
+  if curl -sf "${OLLAMA_URL}/api/tags" >/dev/null 2>&1; then
+    ok "Ollama       running (${OLLAMA_URL})"
+  else
+    warn "Ollama       stopped"; down=1
+  fi
+  if [[ "$(docker inspect -f '{{.State.Running}}' "$OWUI_CONTAINER" 2>/dev/null)" == "true" ]]; then
+    ok "OpenWebUI    running (${OWUI_URL})"
+  else
+    warn "OpenWebUI    stopped"; down=1
+  fi
+  if curl -sf "http://localhost:${MCPO_PORT}/openapi.json" >/dev/null 2>&1; then
+    ok "net-diag MCP running (:${MCPO_PORT})"
+  else
+    warn "net-diag MCP stopped"; down=1
+  fi
+  return "$down"
+}
+
+case "${1:-start}" in
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_stop; echo; cmd_start ;;
+  status)  cmd_status ;;
+  *) echo "usage: openWebBuddy [start|stop|restart|status]" >&2; exit 2 ;;
+esac

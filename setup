@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+#
+# setup — preflight checker/installer for openWebBuddy, the offline network
+# troubleshooting assistant.
+#
+#   ./setup           check every requirement of ./openWebBuddy; install whatever is missing
+#   ./setup --check   report only, change nothing
+#
+# Targets Debian-family Linux (Raspberry Pi OS, Debian, PureOS, Ubuntu). Uses
+# sudo for system-level installs; everything user-level (venv, model pull)
+# runs as you.
+#
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "error: Linux only for now — macOS is not supported yet (most diagnostic tools require Linux networking commands)" >&2
+  exit 1
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MCP_DIR="$ROOT/net-mcp"
+VENV="$MCP_DIR/.venv"
+REQUIREMENTS="$MCP_DIR/requirements.txt"
+
+[[ -f "$ROOT/openWebBuddy" ]] || { echo "error: ./openWebBuddy not found next to setup — run from the project directory" >&2; exit 1; }
+[[ -f "$REQUIREMENTS" ]] || { echo "error: $REQUIREMENTS missing — incomplete clone?" >&2; exit 1; }
+
+# USER can be unset in minimal shells/containers; several checks below need it.
+USER="${USER:-$(id -un)}"
+
+# Keep the model in sync with ./openWebBuddy rather than duplicating it here.
+MODEL="$(grep -m1 '^MODEL=' "$ROOT/openWebBuddy" 2>/dev/null | cut -d'"' -f2 || true)"
+MODEL="${MODEL:-llama3.2:1b}"
+
+OWUI_CONTAINER="open-webui"
+OWUI_IMAGE="ghcr.io/open-webui/open-webui:main"
+
+mapfile -t PY_PACKAGES < <(grep -vE '^[[:space:]]*(#|$)' "$REQUIREMENTS")
+
+# --- OpenWebUI first-boot seeding -------------------------------------------
+# These env vars seed a FRESH docker volume's database on first launch only;
+# an existing volume's DB takes precedence and silently ignores them.
+# info.id "Server" is load-bearing: the model record pins tool id "server:Server".
+OWUI_TOOL_SERVERS="$(cat <<'JSON'
+[{"url":"http://host.docker.internal:8000","path":"openapi.json","type":"openapi","auth_type":"bearer","headers":null,"key":"","config":{"enable":true,"function_name_filter_list":[],"access_grants":[]},"spec_type":"url","spec":"","info":{"id":"Server","name":"Net-Diag Tools","description":"Offline network troubleshooting tools (gateway, ping, traceroute, DNS, ARP, port scan, router audit)"}}]
+JSON
+)"
+OWUI_PROMPT_SUGGESTIONS="$(cat <<'JSON'
+[{"title":["My internet is down","help me figure out why"],"content":"My internet is down. Walk me through diagnosing it step by step — start with the gateway, then work outward to DNS and the web."},{"title":["Is my router OK?","run a quick health/security audit"],"content":"Run a quick audit of my router and tell me if anything looks wrong or risky."},{"title":["Wi-Fi feels slow","check signal and connection quality"],"content":"My Wi-Fi feels slow. Check the signal strength and connection quality and tell me what could be improved."},{"title":["Who's on my network?","scan the LAN for devices"],"content":"Scan my local network and list all the devices you can find."},{"title":["Is DNS working?","compare my router vs public DNS"],"content":"Check whether DNS is working correctly — compare my router's DNS against a public resolver like 1.1.1.1."},{"title":["Check a website","is it me or is it down?"],"content":"Check whether example.com is reachable from here, and show the timing of each connection phase."}]
+JSON
+)"
+
+CHECK_ONLY=0
+[[ "${1:-}" == "--check" ]] && CHECK_ONLY=1
+
+# ---------------------------------------------------------------------------
+# Pretty output (same conventions as ./openWebBuddy)
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  BLU=$'\033[34m'; GRN=$'\033[32m'; YLW=$'\033[33m'; RED=$'\033[31m'; RST=$'\033[0m'
+else
+  BLU=""; GRN=""; YLW=""; RED=""; RST=""
+fi
+step() { printf "%s==>%s %s\n" "$BLU" "$RST" "$*"; }
+ok()   { printf "  %s✓%s %s\n" "$GRN" "$RST" "$*"; }
+miss() { printf "  %s✗%s %s\n" "$YLW" "$RST" "$*"; MISSING=1; }
+die()  { printf "  %s✗%s %s\n" "$RED" "$RST" "$*" >&2; exit 1; }
+
+MISSING=0
+
+# ---------------------------------------------------------------------------
+# 1. Diagnostic CLI tools (used by net_mcp_server.py and openWebBuddy itself)
+#    command → apt package that provides it
+# ---------------------------------------------------------------------------
+declare -A CMD_PKG=(
+  [curl]=curl [dig]=dnsutils [traceroute]=traceroute [nmap]=nmap
+  [arp-scan]=arp-scan [arp]=net-tools [iw]=iw [ss]=iproute2 [ip]=iproute2
+  [python3]=python3
+)
+APT_MISSING=()
+
+check_commands() {
+  step "Diagnostic CLI tools"
+  local cmd
+  for cmd in "${!CMD_PKG[@]}"; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      ok "$cmd"
+    else
+      miss "$cmd (apt: ${CMD_PKG[$cmd]})"
+      APT_MISSING+=("${CMD_PKG[$cmd]}")
+    fi
+  done
+  # The venv module itself is stdlib; what python3-venv actually provides is
+  # ensurepip, so probe that — `python3 -m venv --help` passes even without it.
+  if python3 -c 'import ensurepip' >/dev/null 2>&1; then
+    ok "python3 venv module"
+  else
+    miss "python3 venv module (apt: python3-venv)"
+    APT_MISSING+=(python3-venv)
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 2. Docker + OpenWebUI container
+# ---------------------------------------------------------------------------
+check_docker() {
+  step "Docker"
+  if command -v docker >/dev/null 2>&1; then
+    ok "docker installed"
+  else
+    miss "docker (apt: docker.io)"
+    APT_MISSING+=(docker.io)
+    # No docker means the group and container are guaranteed missing too.
+    NEED_DOCKER_GROUP=1
+    NEED_OWUI=1
+    return
+  fi
+  if id -nG "$USER" | tr ' ' '\n' | grep -x docker >/dev/null; then
+    ok "user '$USER' in docker group"
+  else
+    miss "user '$USER' not in docker group (openWebBuddy runs docker without sudo)"
+    NEED_DOCKER_GROUP=1
+  fi
+  if docker inspect "$OWUI_CONTAINER" >/dev/null 2>&1; then
+    ok "container '$OWUI_CONTAINER' exists"
+  else
+    miss "container '$OWUI_CONTAINER' missing"
+    NEED_OWUI=1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 3. Ollama + model + bind address
+# ---------------------------------------------------------------------------
+check_ollama() {
+  step "Ollama"
+  if command -v ollama >/dev/null 2>&1; then
+    ok "ollama installed"
+  else
+    miss "ollama not installed"
+    NEED_OLLAMA=1
+    return
+  fi
+  local list
+  if list="$(ollama list 2>/dev/null)"; then
+    if awk '{print $1}' <<<"$list" | grep -xF "$MODEL" >/dev/null; then
+      ok "model $MODEL pulled"
+    else
+      miss "model $MODEL not pulled"
+      NEED_MODEL=1
+    fi
+  else
+    # Daemon not running (normal after ./openWebBuddy stop) — can't tell if
+    # the model is on disk. Install mode starts the service and re-pulls (a
+    # fast no-op when it's already present).
+    miss "ollama service not running — cannot verify model $MODEL"
+    NEED_MODEL=1
+  fi
+}
+
+check_ollama_bind() {
+  step "Ollama bind address (the OpenWebUI container must reach :11434)"
+  if ! command -v ollama >/dev/null 2>&1; then
+    ok "will be configured when ollama is installed"
+    return
+  fi
+  # Stock ollama binds 127.0.0.1 only — invisible from inside docker. The
+  # fix is a systemd override setting OLLAMA_HOST=0.0.0.0.
+  if systemctl cat ollama 2>/dev/null | grep OLLAMA_HOST >/dev/null; then
+    ok "OLLAMA_HOST override present"
+  else
+    miss "ollama binds 127.0.0.1 only — the OpenWebUI container cannot reach it"
+    NEED_OLLAMA_BIND=1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 4. Python venv for the MCP server
+# ---------------------------------------------------------------------------
+check_venv() {
+  step "net-mcp Python environment"
+  if [[ -x "$VENV/bin/python" ]] && [[ -x "$VENV/bin/mcpo" ]] \
+      && "$VENV/bin/python" -c "import mcp, ollama" >/dev/null 2>&1; then
+    ok "venv with ${PY_PACKAGES[*]}"
+  else
+    miss "venv missing or incomplete at net-mcp/.venv"
+    NEED_VENV=1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 5. Passwordless sudo (openWebBuddy needs `sudo -n systemctl start/stop
+#    ollama`; arp_scan_lan works better with `sudo -n arp-scan`)
+# ---------------------------------------------------------------------------
+SUDOERS_FILE="/etc/sudoers.d/openwebbuddy"
+
+check_sudoers() {
+  step "Passwordless sudo for openWebBuddy"
+  # `sudo -n -l <cmd>` exits 0 only if <cmd> is allowed without a password —
+  # covers both a specific rule and blanket NOPASSWD:ALL (e.g. Raspberry Pi OS).
+  if sudo -n -l systemctl start ollama >/dev/null 2>&1; then
+    ok "passwordless 'systemctl start ollama' allowed"
+  else
+    miss "no NOPASSWD rule for 'systemctl start/stop ollama' ($SUDOERS_FILE)"
+    NEED_SUDOERS=1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Install phase
+# ---------------------------------------------------------------------------
+apply_ollama_bind() {
+  step "Configuring Ollama to listen on all interfaces (OLLAMA_HOST=0.0.0.0)"
+  sudo mkdir -p /etc/systemd/system/ollama.service.d
+  printf '[Service]\nEnvironment="OLLAMA_HOST=0.0.0.0"\n' \
+    | sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null
+  sudo systemctl daemon-reload
+  if systemctl is-active --quiet ollama; then
+    sudo systemctl restart ollama
+  fi
+  ok "override installed (note: Ollama is now reachable from your LAN, not just this machine)"
+}
+
+install_missing() {
+  if (( ${#APT_MISSING[@]} )); then
+    step "Installing apt packages: ${APT_MISSING[*]}"
+    command -v apt-get >/dev/null 2>&1 \
+      || die "no apt-get on this system — install these manually: ${APT_MISSING[*]}"
+    sudo apt-get update -qq
+    sudo apt-get install -y "${APT_MISSING[@]}"
+    ok "apt packages installed"
+  fi
+
+  if (( ${NEED_DOCKER_GROUP:-0} )); then
+    step "Adding '$USER' to docker group"
+    sudo usermod -aG docker "$USER"
+    ok "added — log out and back in (or run 'newgrp docker') before ./openWebBuddy"
+  fi
+
+  if (( ${NEED_OLLAMA:-0} )); then
+    step "Installing Ollama (official install script)"
+    curl -fsSL https://ollama.com/install.sh | sh
+    ok "ollama installed"
+    apply_ollama_bind
+    NEED_OLLAMA_BIND=0
+    NEED_MODEL=1
+  fi
+
+  if (( ${NEED_OLLAMA_BIND:-0} )); then
+    apply_ollama_bind
+  fi
+
+  if (( ${NEED_MODEL:-0} )); then
+    step "Pulling model $MODEL"
+    sudo systemctl start ollama 2>/dev/null || true
+    # systemctl returns before :11434 accepts connections — wait for readiness.
+    local i
+    for i in $(seq 1 30); do
+      curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && break
+      sleep 1
+    done
+    ollama pull "$MODEL"
+    ok "model ready"
+  fi
+
+  if (( ${NEED_OWUI:-0} )); then
+    step "Creating OpenWebUI container"
+    # Fresh docker-group membership doesn't apply to this shell — fall back to
+    # sudo so container creation works before the user re-logs in.
+    local -a dkr=(docker)
+    docker info >/dev/null 2>&1 || dkr=(sudo docker)
+    if "${dkr[@]}" inspect "$OWUI_CONTAINER" >/dev/null 2>&1; then
+      ok "container '$OWUI_CONTAINER' already exists"
+    else
+      "${dkr[@]}" run -d --name "$OWUI_CONTAINER" \
+        -p 3000:8080 \
+        --add-host=host.docker.internal:host-gateway \
+        -v open-webui:/app/backend/data \
+        --restart always \
+        -e DEFAULT_MODELS="$MODEL" \
+        -e ENABLE_FOLLOW_UP_GENERATION=False \
+        -e ENABLE_TAGS_GENERATION=False \
+        -e ENABLE_COMMUNITY_SHARING=False \
+        -e ENABLE_EVALUATION_ARENA_MODELS=False \
+        -e TOOL_SERVER_CONNECTIONS="$OWUI_TOOL_SERVERS" \
+        -e DEFAULT_PROMPT_SUGGESTIONS="$OWUI_PROMPT_SUGGESTIONS" \
+        "$OWUI_IMAGE"
+      ok "container '$OWUI_CONTAINER' created (first start downloads the image; give it a minute)"
+    fi
+  fi
+
+  if (( ${NEED_VENV:-0} )); then
+    step "Creating Python venv + installing ${PY_PACKAGES[*]}"
+    python3 -m venv "$VENV"
+    "$VENV/bin/pip" install --quiet --upgrade pip
+    "$VENV/bin/pip" install --quiet -r "$REQUIREMENTS"
+    ok "venv ready"
+  fi
+
+  if (( ${NEED_SUDOERS:-0} )); then
+    step "Installing sudoers rules ($SUDOERS_FILE)"
+    local systemctl_bin arpscan_bin rules tmp
+    systemctl_bin="$(command -v systemctl)" || die "systemctl not found"
+    arpscan_bin="$(command -v arp-scan || true)"
+    rules="$USER ALL=(root) NOPASSWD: $systemctl_bin start ollama, $systemctl_bin stop ollama"
+    [[ -n "$arpscan_bin" ]] && rules+=$'\n'"$USER ALL=(root) NOPASSWD: $arpscan_bin --localnet"
+    tmp="$(mktemp)"
+    printf '%s\n' "$rules" >"$tmp"
+    if sudo visudo -cf "$tmp" >/dev/null; then
+      sudo install -m 0440 "$tmp" "$SUDOERS_FILE"
+      ok "installed"
+    else
+      rm -f "$tmp"
+      die "generated sudoers rules failed validation — not installed"
+    fi
+    rm -f "$tmp"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+check_commands
+check_docker
+check_ollama
+check_ollama_bind
+check_venv
+check_sudoers
+echo
+
+if (( ! MISSING )); then
+  printf "%s✓ All requirements satisfied — ./openWebBuddy is ready to run.%s\n" "$GRN" "$RST"
+  exit 0
+fi
+
+if (( CHECK_ONLY )); then
+  printf "%s! Missing requirements found (see ✗ above). Run ./setup to install them.%s\n" "$YLW" "$RST"
+  exit 1
+fi
+
+# Installing needs sudo; fail early with a clear message rather than mid-install.
+if ! id -nG "$USER" | tr ' ' '\n' | grep -Ex 'sudo|wheel|admin' >/dev/null \
+    && ! sudo -v 2>/dev/null; then
+  die "user '$USER' cannot sudo — add them to the sudo group first (as root: usermod -aG sudo $USER), then re-run"
+fi
+
+install_missing
+echo
+printf "%s✓ Setup complete — run ./openWebBuddy to start.%s\n" "$GRN" "$RST"
+printf "%s  First time? OpenWebUI will ask you to create an admin account in the browser.%s\n" "$YLW" "$RST"
+printf "%s  Then create an API key (Settings → Account → API keys) and run: ./bootstrap-openwebui <key>%s\n" "$YLW" "$RST"
