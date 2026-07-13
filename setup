@@ -22,6 +22,20 @@ MCP_DIR="$ROOT/net-mcp"
 VENV="$MCP_DIR/.venv"
 REQUIREMENTS="$MCP_DIR/requirements.txt"
 
+# Optional machine-local overrides (gitignored), e.g. MCPO_PORT=8100.
+# shellcheck source=/dev/null
+[[ -f "$ROOT/.env" ]] && source "$ROOT/.env"
+
+# Port for the mcpo tool bridge. Must match ./openWebBuddy — it is baked into
+# the OpenWebUI container's tool-server URL below, so changing it later means
+# recreating the container.
+MCPO_PORT="${MCPO_PORT:-8000}"
+OWUI_PORT="${OWUI_PORT:-3000}"
+
+# mcp requires Python >= 3.10, which is newer than the system python3 on some
+# supported distros (Debian 11 / PureOS 10 ship 3.9).
+PY_MIN="3.10"
+
 [[ -f "$ROOT/openWebBuddy" ]] || { echo "error: ./openWebBuddy not found next to setup — run from the project directory" >&2; exit 1; }
 [[ -f "$REQUIREMENTS" ]] || { echo "error: $REQUIREMENTS missing — incomplete clone?" >&2; exit 1; }
 
@@ -33,16 +47,27 @@ MODEL="$(grep -m1 '^MODEL=' "$ROOT/openWebBuddy" 2>/dev/null | cut -d'"' -f2 || 
 MODEL="${MODEL:-llama3.2:1b}"
 
 OWUI_CONTAINER="open-webui"
-OWUI_IMAGE="ghcr.io/open-webui/open-webui:main"
+# Pin the image. ':main' is a moving tag: upstream once flipped ENABLE_API_KEYS
+# to default-off, which silently broke setup for new users while every existing
+# container kept working. Bump this deliberately, having tested the new version.
+OWUI_IMAGE="ghcr.io/open-webui/open-webui:v0.6.40"
+
+# The container runs on the host's network namespace. That means it reaches both
+# Ollama and mcpo over plain 127.0.0.1, so neither has to listen on 0.0.0.0 and
+# no host.docker.internal alias is needed. Linux-only — which this project
+# already is.
+OLLAMA_LOCAL_URL="http://127.0.0.1:11434"
 
 mapfile -t PY_PACKAGES < <(grep -vE '^[[:space:]]*(#|$)' "$REQUIREMENTS")
 
 # --- OpenWebUI first-boot seeding -------------------------------------------
-# These env vars seed a FRESH docker volume's database on first launch only;
-# an existing volume's DB takes precedence and silently ignores them.
+# OpenWebUI only consults these for config keys absent from the database, so on
+# an install that predates openWebBuddy they are quietly ignored. That is why
+# ./bootstrap-openwebui re-applies the tool server through the API rather than
+# trusting this.
 # info.id "Server" is load-bearing: the model record pins tool id "server:Server".
-OWUI_TOOL_SERVERS="$(cat <<'JSON'
-[{"url":"http://host.docker.internal:8000","path":"openapi.json","type":"openapi","auth_type":"bearer","headers":null,"key":"","config":{"enable":true,"function_name_filter_list":[],"access_grants":[]},"spec_type":"url","spec":"","info":{"id":"Server","name":"Net-Diag Tools","description":"Offline network troubleshooting tools (gateway, ping, traceroute, DNS, ARP, port scan, router audit)"}}]
+OWUI_TOOL_SERVERS="$(cat <<JSON
+[{"url":"http://127.0.0.1:${MCPO_PORT}","path":"openapi.json","type":"openapi","auth_type":"bearer","headers":null,"key":"","config":{"enable":true,"function_name_filter_list":[],"access_grants":[]},"spec_type":"url","spec":"","info":{"id":"Server","name":"Net-Diag Tools","description":"Offline network troubleshooting tools (gateway, ping, traceroute, DNS, ARP, port scan, router audit)"}}]
 JSON
 )"
 OWUI_PROMPT_SUGGESTIONS="$(cat <<'JSON'
@@ -90,13 +115,41 @@ check_commands() {
       APT_MISSING+=("${CMD_PKG[$cmd]}")
     fi
   done
-  # The venv module itself is stdlib; what python3-venv actually provides is
-  # ensurepip, so probe that — `python3 -m venv --help` passes even without it.
-  if python3 -c 'import ensurepip' >/dev/null 2>&1; then
-    ok "python3 venv module"
+}
+
+# ---------------------------------------------------------------------------
+# 1b. A Python interpreter new enough for mcp (>= 3.10)
+#
+# Debian 11 / PureOS 10 ship Python 3.9 and have no 3.10+ in apt, so `python3`
+# is not necessarily a usable interpreter here. Picking the wrong one surfaces
+# as an inscrutable pip resolver error ("Ignored the following versions that
+# require a different python version ... No matching distribution found for
+# mcp"), so resolve it explicitly and say so.
+# ---------------------------------------------------------------------------
+PYBIN=""
+
+find_python() {
+  local c
+  for c in python3.13 python3.12 python3.11 python3.10 python3 \
+           "$HOME/.local/bin/python3.12"; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    # Needs both the version floor and ensurepip (what python3-venv provides);
+    # `python -m venv --help` passes even when ensurepip is absent.
+    if "$c" -c 'import sys,ensurepip; sys.exit(0 if sys.version_info >= (3,10) else 1)' >/dev/null 2>&1; then
+      PYBIN="$(command -v "$c")"
+      return 0
+    fi
+  done
+  return 1
+}
+
+check_python() {
+  step "Python >= $PY_MIN with venv support (required by mcp)"
+  if find_python; then
+    ok "$PYBIN ($("$PYBIN" -V 2>&1 | cut -d' ' -f2))"
   else
-    miss "python3 venv module (apt: python3-venv)"
-    APT_MISSING+=(python3-venv)
+    miss "no Python >= $PY_MIN found (system python3 is $(python3 -V 2>&1 | cut -d' ' -f2 || echo absent))"
+    NEED_PYTHON=1
   fi
 }
 
@@ -121,11 +174,30 @@ check_docker() {
     miss "user '$USER' not in docker group (openWebBuddy runs docker without sudo)"
     NEED_DOCKER_GROUP=1
   fi
-  if docker inspect "$OWUI_CONTAINER" >/dev/null 2>&1; then
-    ok "container '$OWUI_CONTAINER' exists"
-  else
+  # A container from an older openWebBuddy — or from an unrelated project that
+  # happened to claim the name — can be wrong in ways no amount of restarting
+  # fixes: --add-host and -e are set once, at creation. So audit the two settings
+  # that openWebBuddy cannot work without and recreate if either is absent. The
+  # named volume is untouched by a recreate, so accounts and chats are kept.
+  if ! docker inspect "$OWUI_CONTAINER" >/dev/null 2>&1; then
     miss "container '$OWUI_CONTAINER' missing"
     NEED_OWUI=1
+    return
+  fi
+  local bad=() netmode image
+  netmode="$(docker inspect "$OWUI_CONTAINER" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null)"
+  [[ "$netmode" == "host" ]] \
+    || bad+=("not on the host network (is '$netmode') — cannot reach Ollama or the tool bridge over 127.0.0.1")
+  image="$(docker inspect "$OWUI_CONTAINER" --format '{{.Config.Image}}' 2>/dev/null)"
+  [[ "$image" == "$OWUI_IMAGE" ]] \
+    || bad+=("running $image, not the pinned $OWUI_IMAGE")
+  if (( ${#bad[@]} )); then
+    miss "container '$OWUI_CONTAINER' is misconfigured — will recreate, keeping its data volume:"
+    printf '      - %s\n' "${bad[@]}"
+    NEED_OWUI=1
+    NEED_OWUI_RECREATE=1
+  else
+    ok "container '$OWUI_CONTAINER' exists and is configured"
   fi
 }
 
@@ -159,18 +231,20 @@ check_ollama() {
 }
 
 check_ollama_bind() {
-  step "Ollama bind address (the OpenWebUI container must reach :11434)"
+  step "Ollama bind address (should be loopback-only)"
   if ! command -v ollama >/dev/null 2>&1; then
-    ok "will be configured when ollama is installed"
+    ok "stock ollama binds 127.0.0.1 — nothing to do"
     return
   fi
-  # Stock ollama binds 127.0.0.1 only — invisible from inside docker. The
-  # fix is a systemd override setting OLLAMA_HOST=0.0.0.0.
-  if systemctl cat ollama 2>/dev/null | grep OLLAMA_HOST >/dev/null; then
-    ok "OLLAMA_HOST override present"
+  # Earlier versions of openWebBuddy published Ollama on 0.0.0.0 via a systemd
+  # override, because a bridge-networked container could not otherwise reach it.
+  # The container is on the host network now, so that override only serves to
+  # expose an unauthenticated model server to the LAN. Take it back off.
+  if systemctl cat ollama 2>/dev/null | grep -q 'OLLAMA_HOST=0\.0\.0\.0'; then
+    miss "OLLAMA_HOST=0.0.0.0 override present — exposes Ollama to the LAN with no auth, and is no longer needed"
+    NEED_OLLAMA_UNBIND=1
   else
-    miss "ollama binds 127.0.0.1 only — the OpenWebUI container cannot reach it"
-    NEED_OLLAMA_BIND=1
+    ok "not exposed beyond localhost"
   fi
 }
 
@@ -209,16 +283,54 @@ check_sudoers() {
 # ---------------------------------------------------------------------------
 # Install phase
 # ---------------------------------------------------------------------------
-apply_ollama_bind() {
-  step "Configuring Ollama to listen on all interfaces (OLLAMA_HOST=0.0.0.0)"
-  sudo mkdir -p /etc/systemd/system/ollama.service.d
-  printf '[Service]\nEnvironment="OLLAMA_HOST=0.0.0.0"\n' \
-    | sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null
+OLLAMA_OVERRIDE="/etc/systemd/system/ollama.service.d/override.conf"
+
+remove_ollama_bind() {
+  step "Removing the OLLAMA_HOST=0.0.0.0 override (Ollama back to localhost-only)"
+  # Only drop the file if the override we wrote is all that is in it — a user may
+  # have added unrelated settings to the same drop-in.
+  if grep -qv 'OLLAMA_HOST=0\.0\.0\.0\|^\[Service\]$\|^\s*$' "$OLLAMA_OVERRIDE" 2>/dev/null; then
+    miss "$OLLAMA_OVERRIDE has other settings in it — remove the OLLAMA_HOST line yourself"
+    return
+  fi
+  sudo rm -f "$OLLAMA_OVERRIDE"
+  sudo rmdir /etc/systemd/system/ollama.service.d 2>/dev/null || true
   sudo systemctl daemon-reload
   if systemctl is-active --quiet ollama; then
     sudo systemctl restart ollama
   fi
-  ok "override installed (note: Ollama is now reachable from your LAN, not just this machine)"
+  ok "Ollama no longer listens beyond this machine"
+}
+
+install_python() {
+  step "Providing a Python >= $PY_MIN"
+
+  # Case 1: python3 is already new enough and is only missing ensurepip, which
+  # on Debian-family distros lives in a separate python3-venv package.
+  if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null \
+      && command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update -qq
+    sudo apt-get install -y python3-venv
+    if find_python; then
+      ok "using $PYBIN"
+      return
+    fi
+  fi
+
+  # Case 2: the distro has no Python >= 3.10 at all (Debian 11 / PureOS 10 cap
+  # out at 3.9). Fetch a standalone CPython with uv — user-level, no root, no
+  # compiling, and it leaves the system python3 untouched.
+  ok "system python3 is older than $PY_MIN — fetching a standalone CPython 3.12"
+  local uv
+  uv="$(command -v uv || true)"
+  if [[ -z "$uv" ]]; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    uv="$HOME/.local/bin/uv"
+  fi
+  [[ -x "$uv" ]] || die "could not install uv — install Python >= $PY_MIN yourself, then re-run"
+  "$uv" python install 3.12
+  find_python || die "still no Python >= $PY_MIN after installing one"
+  ok "using $PYBIN"
 }
 
 install_missing() {
@@ -241,13 +353,13 @@ install_missing() {
     step "Installing Ollama (official install script)"
     curl -fsSL https://ollama.com/install.sh | sh
     ok "ollama installed"
-    apply_ollama_bind
-    NEED_OLLAMA_BIND=0
+    # A fresh install binds 127.0.0.1, which is what we want.
+    NEED_OLLAMA_UNBIND=0
     NEED_MODEL=1
   fi
 
-  if (( ${NEED_OLLAMA_BIND:-0} )); then
-    apply_ollama_bind
+  if (( ${NEED_OLLAMA_UNBIND:-0} )); then
+    remove_ollama_bind
   fi
 
   if (( ${NEED_MODEL:-0} )); then
@@ -269,14 +381,24 @@ install_missing() {
     # sudo so container creation works before the user re-logs in.
     local -a dkr=(docker)
     docker info >/dev/null 2>&1 || dkr=(sudo docker)
+    if (( ${NEED_OWUI_RECREATE:-0} )); then
+      # `docker rm` does not touch the named volume, so the database — accounts,
+      # chats, settings — is carried over to the replacement container.
+      "${dkr[@]}" rm -f "$OWUI_CONTAINER" >/dev/null
+      ok "removed misconfigured container (data volume '$OWUI_CONTAINER' kept)"
+    fi
     if "${dkr[@]}" inspect "$OWUI_CONTAINER" >/dev/null 2>&1; then
       ok "container '$OWUI_CONTAINER' already exists"
     else
+      # --network host (rather than -p + host.docker.internal) is what lets Ollama
+      # and mcpo stay bound to 127.0.0.1 instead of being published to the LAN.
+      # PORT replaces the -p mapping; there is no port namespace to map through.
       "${dkr[@]}" run -d --name "$OWUI_CONTAINER" \
-        -p 3000:8080 \
-        --add-host=host.docker.internal:host-gateway \
+        --network host \
         -v open-webui:/app/backend/data \
         --restart always \
+        -e PORT="$OWUI_PORT" \
+        -e OLLAMA_BASE_URL="$OLLAMA_LOCAL_URL" \
         -e DEFAULT_MODELS="$MODEL" \
         -e ENABLE_FOLLOW_UP_GENERATION=False \
         -e ENABLE_TAGS_GENERATION=False \
@@ -289,12 +411,19 @@ install_missing() {
     fi
   fi
 
+  if (( ${NEED_PYTHON:-0} )); then
+    install_python
+  fi
+
   if (( ${NEED_VENV:-0} )); then
     step "Creating Python venv + installing ${PY_PACKAGES[*]}"
-    python3 -m venv "$VENV"
+    # Never fall back to a bare `python3` here: on Debian 11 / PureOS 10 that is
+    # 3.9, and the venv only fails later, deep inside pip's resolver.
+    [[ -n "$PYBIN" ]] || find_python || die "no Python >= $PY_MIN available to build the venv"
+    "$PYBIN" -m venv "$VENV"
     "$VENV/bin/pip" install --quiet --upgrade pip
     "$VENV/bin/pip" install --quiet -r "$REQUIREMENTS"
-    ok "venv ready"
+    ok "venv ready on $("$VENV/bin/python" -V 2>&1)"
   fi
 
   if (( ${NEED_SUDOERS:-0} )); then
@@ -321,6 +450,7 @@ install_missing() {
 # Run
 # ---------------------------------------------------------------------------
 check_commands
+check_python
 check_docker
 check_ollama
 check_ollama_bind

@@ -2,20 +2,30 @@
 #
 # bootstrap-openwebui — one-time OpenWebUI configuration after first signup.
 #
-#   ./bootstrap-openwebui <openwebui-api-key>
+#   ./bootstrap-openwebui <admin-email>
 #
-# On a fresh machine, ./setup seeds most OpenWebUI settings via env vars, but
-# pinning the Net-Diag tool server to the model requires an authenticated API
-# call — and no API key can exist until the admin account does. So, once:
-# open the chat, create the admin account, generate an API key under
-# Settings → Account → API keys, then run this script with that key.
+# Wiring the Net-Diag tools to the model takes an authenticated API call, and
+# nothing can authenticate until the admin account exists. So, once: open the
+# chat, create the admin account, then run this with that account's email. It
+# prompts for the password and signs in.
+#
+# (Earlier versions wanted an API key from Settings → Account. That turned out
+# to be unnecessary — the session token from a normal sign-in is accepted by
+# every endpoint used here — and it needed two OpenWebUI feature flags that
+# default to off, which made the documented setup flow impossible to complete.)
 #
 # Safe to re-run; it detects already-applied state.
 #
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OWUI_URL="http://localhost:3000"
+
+# Machine-local overrides (gitignored) — same file ./setup and ./openWebBuddy read.
+# shellcheck source=/dev/null
+[[ -f "$ROOT/.env" ]] && source "$ROOT/.env"
+
+OWUI_URL="${OWUI_URL:-http://localhost:3000}"
+MCPO_PORT="${MCPO_PORT:-8000}"
 
 if [[ -t 1 ]]; then
   BLU=$'\033[34m'; GRN=$'\033[32m'; RED=$'\033[31m'; RST=$'\033[0m'
@@ -26,19 +36,57 @@ step() { printf "%s==>%s %s\n" "$BLU" "$RST" "$*"; }
 ok()   { printf "  %s✓%s %s\n" "$GRN" "$RST" "$*"; }
 die()  { printf "  %s✗%s %s\n" "$RED" "$RST" "$*" >&2; exit 1; }
 
-KEY="${1:-}"
-[[ -n "$KEY" ]] || die "usage: ./bootstrap-openwebui <openwebui-api-key>  (create one under Settings → Account → API keys after admin signup)"
+EMAIL="${1:-}"
+[[ -n "$EMAIL" ]] || die "usage: ./bootstrap-openwebui <admin-email>  (the account you created in the browser)"
 
 # Same source of truth as ./setup: the MODEL line in the launcher.
 MODEL="$(grep -m1 '^MODEL=' "$ROOT/openWebBuddy" 2>/dev/null | cut -d'"' -f2 || true)"
 MODEL="${MODEL:-llama3.2:1b}"
 
-AUTH=(-H "Authorization: Bearer $KEY" -H "Content-Type: application/json")
-
 step "OpenWebUI at $OWUI_URL"
 curl -sf --max-time 5 "$OWUI_URL/health" >/dev/null \
   || die "OpenWebUI is not reachable — start it first (./openWebBuddy)"
 ok "reachable"
+
+step "Signing in as $EMAIL"
+# Prompted, not passed as an argument: a command line is visible to anyone
+# running `ps` and gets written to shell history. OWUI_PASSWORD covers unattended
+# runs. Both the email and the password go through python rather than string
+# interpolation, so quotes and backslashes in a password survive intact.
+PASSWORD="${OWUI_PASSWORD:-}"
+if [[ -z "$PASSWORD" ]]; then
+  read -rsp "  password for ${EMAIL}: " PASSWORD
+  echo
+fi
+[[ -n "$PASSWORD" ]] || die "no password given"
+
+credentials="$(EMAIL="$EMAIL" PASSWORD="$PASSWORD" python3 -c \
+  'import json, os; print(json.dumps({"email": os.environ["EMAIL"], "password": os.environ["PASSWORD"]}))')"
+TOKEN="$(curl -s -X POST "$OWUI_URL/api/v1/auths/signin" \
+  -H 'Content-Type: application/json' -d "$credentials" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))' 2>/dev/null || true)"
+unset PASSWORD credentials
+[[ -n "$TOKEN" ]] || die "sign-in failed — check the email and password"
+ok "signed in"
+
+AUTH=(-H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
+
+step "Registering the Net-Diag tool server"
+# ./setup seeds this via TOOL_SERVER_CONNECTIONS, but that env var only supplies
+# a *default*: OpenWebUI ignores it for any key already stored in the database.
+# Registering it here through the admin API is what makes the tool server exist
+# on an OpenWebUI that predates openWebBuddy — and it persists it to the DB, so
+# the model's "server:Server" reference below always resolves.
+tool_servers="$(cat <<JSON
+{"TOOL_SERVER_CONNECTIONS":[{"url":"http://127.0.0.1:${MCPO_PORT}","path":"openapi.json","type":"openapi","auth_type":"bearer","headers":null,"key":"","config":{"enable":true,"function_name_filter_list":[],"access_grants":[]},"spec_type":"url","spec":"","info":{"id":"Server","name":"Net-Diag Tools","description":"Offline network troubleshooting tools (gateway, ping, traceroute, DNS, ARP, port scan, router audit)"}}]}
+JSON
+)"
+resp="$(curl -s "${AUTH[@]}" -X POST -d "$tool_servers" "$OWUI_URL/api/v1/configs/tool_servers" || true)"
+if grep -q '"TOOL_SERVER_CONNECTIONS"' <<<"$resp"; then
+  ok "tool server 'Server' -> http://127.0.0.1:${MCPO_PORT}"
+else
+  die "could not register the tool server: ${resp:-no response}"
+fi
 
 step "Pinning Net-Diag tools to model $MODEL"
 payload="$(cat <<JSON
@@ -51,12 +99,22 @@ if grep -qi 'taken\|already exist' <<<"$resp"; then
 elif grep -q "\"id\":\"$MODEL\"" <<<"$resp"; then
   ok "model record created with Net-Diag tools pinned"
 else
-  die "models/create failed: ${resp:-no response} (bad API key?)"
+  die "models/create failed: ${resp:-no response}"
 fi
 
 step "Setting default model to $MODEL"
-curl -s "${AUTH[@]}" -X POST -d "{\"config\":{\"ui.default_models\":\"$MODEL\"}}" \
-  "$OWUI_URL/api/v1/configs/import" >/dev/null \
+# configs/import replaces the config blob wholesale, and OpenWebUI resolves
+# config paths as nested keys. So read the current config, merge one key, and
+# post the whole thing back: a flat {"ui.default_models": ...} would discard
+# every other setting and still never be read.
+merged="$(curl -sf "${AUTH[@]}" "$OWUI_URL/api/v1/configs/export" \
+  | MODEL="$MODEL" python3 -c '
+import json, os, sys
+cfg = json.load(sys.stdin)
+cfg.setdefault("ui", {})["default_models"] = os.environ["MODEL"]
+print(json.dumps({"config": cfg}))
+')" || die "could not read the current config"
+curl -sf "${AUTH[@]}" -X POST -d "$merged" "$OWUI_URL/api/v1/configs/import" >/dev/null \
   || die "configs/import failed"
 ok "submitted"
 
@@ -71,11 +129,19 @@ else
   FAIL=1
 fi
 default_model="$(curl -s "${AUTH[@]}" "$OWUI_URL/api/v1/configs/export" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ui.default_models",""))' 2>/dev/null || true)"
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ui",{}).get("default_models",""))' 2>/dev/null || true)"
 if [[ "$default_model" == "$MODEL" ]]; then
   ok "default model is $MODEL"
 else
   printf "  %s✗%s default model not confirmed (got: '%s')\n" "$RED" "$RST" "$default_model" >&2
+  FAIL=1
+fi
+tool_server_url="$(curl -s "${AUTH[@]}" "$OWUI_URL/api/v1/configs/tool_servers" \
+  | python3 -c 'import json,sys; c=json.load(sys.stdin).get("TOOL_SERVER_CONNECTIONS") or []; print(c[0]["url"] if c else "")' 2>/dev/null || true)"
+if [[ -n "$tool_server_url" ]]; then
+  ok "tool server reachable at $tool_server_url"
+else
+  printf "  %s✗%s tool server not registered\n" "$RED" "$RST" >&2
   FAIL=1
 fi
 

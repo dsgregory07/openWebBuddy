@@ -20,6 +20,13 @@ fi
 # Configuration
 # ---------------------------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Optional machine-local overrides (gitignored), e.g. MCPO_PORT=8100 when
+# something else already owns :8000. ./setup reads the same file, so the
+# container's tool-server URL is built from the same value.
+# shellcheck source=/dev/null
+[[ -f "$ROOT/.env" ]] && source "$ROOT/.env"
+
 MCP_DIR="$ROOT/net-mcp"
 PY="$MCP_DIR/.venv/bin/python"
 MCPO="$MCP_DIR/.venv/bin/mcpo"
@@ -37,7 +44,7 @@ OWUI_CONTAINER="open-webui"
 OWUI_PORT="3000"
 OWUI_URL="http://localhost:${OWUI_PORT}"
 
-MCPO_PORT="8000"
+MCPO_PORT="${MCPO_PORT:-8000}"
 
 # ---------------------------------------------------------------------------
 # Pretty output
@@ -130,8 +137,16 @@ start_mcpo() {
     ok "already running on :${MCPO_PORT}"
     return
   fi
+  # An unrelated listener on the port makes mcpo exit with EADDRINUSE, which
+  # would otherwise surface below as a misleading "mcpo did not come up".
+  if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE ":${MCPO_PORT}$"; then
+    die "port ${MCPO_PORT} is already in use by another process — set MCPO_PORT in ${ROOT}/.env to a free port, then re-run ./setup so the container's tool-server URL matches"
+  fi
   mkdir -p "$LOG_DIR"
-  nohup "$MCPO" --port "$MCPO_PORT" --host 0.0.0.0 \
+  # 127.0.0.1, not 0.0.0.0: OpenWebUI shares the host's network namespace, so it
+  # reaches the bridge over loopback. Publishing it would let anyone on the LAN
+  # make this machine run pings and port scans, unauthenticated.
+  nohup "$MCPO" --port "$MCPO_PORT" --host 127.0.0.1 \
       -n "net-diag" \
       -d "Offline network diagnostic tools (ping, traceroute, DNS, ARP, port scan, router audit)" \
       -- "$PY" "$SERVER" \

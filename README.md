@@ -17,11 +17,10 @@ git clone <this repo> && cd openWebBuddy
 First run only — OpenWebUI starts with no accounts:
 
 1. The browser opens `http://localhost:3000`; create the admin account.
-2. Generate an API key: **Settings → Account → API keys**.
-3. Pin the tools to the model:
+2. Pin the tools to the model, using that account (it prompts for the password):
 
 ```bash
-./bootstrap-openwebui <your-api-key>
+./bootstrap-openwebui <your-admin-email>
 ```
 
 Then just chat: *"my internet is down"*, *"is my router OK?"*, *"why is wifi slow?"*
@@ -47,24 +46,53 @@ PureOS note: every apt dependency comes from Debian main; the Ollama binary and
 the OpenWebUI container image are pulled from upstream (ollama.com, ghcr.io)
 rather than PureOS-vetted repos.
 
+### Python
+
+The `mcp` package needs **Python ≥ 3.10**, which is newer than the system
+`python3` on some of the distros above — Debian 11 and PureOS 10 ship 3.9 and
+have nothing newer in apt. `setup` checks for a suitable interpreter and, if the
+system has none, fetches a standalone CPython 3.12 with
+[uv](https://astral.sh/uv) into your home directory. Nothing system-wide is
+touched and `/usr/bin/python3` is left exactly as it was.
+
+Installing the venv with the system 3.9 is what produces pip's rather unhelpful
+`No matching distribution found for mcp==...` — every candidate is skipped for
+requiring a newer Python.
+
+### Local overrides (`.env`)
+
+An optional, gitignored `.env` next to the scripts is read by `setup`,
+`openWebBuddy`, and `bootstrap-openwebui`:
+
+```bash
+MCPO_PORT=8100      # default 8000; change it if something else owns that port
+```
+
+The port is baked into the OpenWebUI container's tool-server URL, so after
+changing it re-run `./setup` — it recreates the container (your accounts and
+chats live in a Docker volume and are kept).
+
 ## Architecture
 
 ```
-  Browser ──▶ OpenWebUI (Docker, :3000)
+  Browser ──▶ OpenWebUI (Docker, --network host, :3000)
                  │
-                 ├─▶ Ollama (systemd, :11434)              model: llama3.2:1b
-                 │     bound to 0.0.0.0 so the container can reach it
+                 ├─▶ Ollama (systemd, 127.0.0.1:11434)     model: llama3.2:1b
                  │
-                 └─▶ tool server  http://host.docker.internal:8000
+                 └─▶ tool server  http://127.0.0.1:8000
                         └─▶ mcpo ── MCP stdio ──▶ net-mcp/net_mcp_server.py
 ```
 
-- **Ollama** — local model server (systemd service `ollama`). `setup` installs
-  an `OLLAMA_HOST=0.0.0.0` systemd override; without it the OpenWebUI container
-  cannot reach the host's Ollama and chats hang.
-- **OpenWebUI** — chat UI (Docker container `open-webui`). On first boot,
-  `setup` seeds it with the tool-server connection, default model, prompt
-  suggestions, and CPU-saving feature toggles.
+- **Ollama** — local model server (systemd service `ollama`), on loopback only.
+- **OpenWebUI** — chat UI (Docker container `open-webui`), pinned to a specific
+  image tag and run with `--network host`. Sharing the host's network namespace
+  is what lets it reach Ollama and the tool bridge over `127.0.0.1`, so neither
+  has to be published to the LAN and no `host.docker.internal` alias is needed.
+  Linux-only, which this project already is.
+- `setup` seeds the tool-server connection, default model, prompt suggestions,
+  and CPU-saving toggles via env vars — but OpenWebUI only honours those for
+  config keys absent from its database, so `bootstrap-openwebui` re-applies the
+  important ones through the API rather than trusting the seed.
 - **net-diag tool server** (`net-mcp/net_mcp_server.py`) — defines the
   diagnostic tools. `mcpo` wraps it as an OpenAPI tool server; it appears in
   OpenWebUI as **"Net-Diag Tools"**.
@@ -98,9 +126,9 @@ Default is `llama3.2:1b` — small enough for snappy CPU-only replies on
 Pi-class hardware, and it supports native tool calling. To swap models:
 
 ```bash
-ollama pull <tag>            # fetch the new model
+ollama pull <tag>              # fetch the new model
 # edit MODEL="..." in ./openWebBuddy
-./bootstrap-openwebui <key>  # re-pin tools + default model
+./bootstrap-openwebui <email>  # re-pin tools + default model
 ```
 
 Avoid thinking/reasoning models (e.g. `qwen3:4b` "Thinking") on CPU-only
@@ -118,10 +146,15 @@ net-mcp/.venv/bin/python net-mcp/ollama_bridge.py --model llama3.2:1b
 
 ## Security notes
 
-- **mcpo (`:8000`) and Ollama (`:11434`) listen on all interfaces with no
-  auth.** That's fine on a trusted home LAN; on shared networks, firewall
-  those ports or bind them to specific interfaces. Anyone who can reach
-  `:8000` can make this machine run pings/port scans.
+- **mcpo (`:8000`, see `MCPO_PORT`) and Ollama (`:11434`) are bound to
+  `127.0.0.1`** — neither is reachable from the network. This matters: they have
+  no authentication, and anyone who could reach the mcpo port would be able to
+  make this machine run pings and port scans on their behalf. Running OpenWebUI
+  on the host network is what makes keeping them on loopback possible.
+- **The chat UI itself (`:3000`) does listen on all interfaces**, so you can
+  reach it from another device on the LAN. It's behind OpenWebUI's own login.
+- If you are upgrading from a version that installed an `OLLAMA_HOST=0.0.0.0`
+  systemd override, `./setup` removes it.
 - `setup` installs a sudoers rule (`/etc/sudoers.d/openwebbuddy`) narrowly
   scoped to `systemctl start/stop ollama` and `arp-scan --localnet` — nothing
   else runs privileged.
@@ -131,4 +164,3 @@ net-mcp/.venv/bin/python net-mcp/ollama_bridge.py --model llama3.2:1b
 - mcpo / tool server: `logs/mcpo.log`
 - OpenWebUI: `docker logs open-webui`
 - Ollama: `journalctl -u ollama`
-# openWebBuddy

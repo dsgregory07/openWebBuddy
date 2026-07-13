@@ -4,6 +4,9 @@
 # Runtime state
 logs/
 
+# Machine-local overrides (MCPO_PORT, ...) — differs per machine, never shared
+.env
+
 # Python
 net-mcp/.venv/
 __pycache__/
