@@ -38,7 +38,7 @@ MCPO_PIDFILE="$LOG_DIR/mcpo.pid"
 
 OLLAMA_SERVICE="ollama"
 OLLAMA_URL="http://localhost:11434"
-MODEL="llama3.2:1b"
+MODEL="qwen3:4b"
 
 OWUI_CONTAINER="open-webui"
 OWUI_PORT="3000"

@@ -44,7 +44,7 @@ USER="${USER:-$(id -un)}"
 
 # Keep the model in sync with ./openWebBuddy rather than duplicating it here.
 MODEL="$(grep -m1 '^MODEL=' "$ROOT/openWebBuddy" 2>/dev/null | cut -d'"' -f2 || true)"
-MODEL="${MODEL:-llama3.2:1b}"
+MODEL="${MODEL:-qwen3:4b}"
 
 OWUI_CONTAINER="open-webui"
 # Pin the image. ':main' is a moving tag: upstream once flipped ENABLE_API_KEYS

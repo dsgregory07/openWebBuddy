@@ -41,7 +41,7 @@ EMAIL="${1:-}"
 
 # Same source of truth as ./setup: the MODEL line in the launcher.
 MODEL="$(grep -m1 '^MODEL=' "$ROOT/openWebBuddy" 2>/dev/null | cut -d'"' -f2 || true)"
-MODEL="${MODEL:-llama3.2:1b}"
+MODEL="${MODEL:-qwen3:4b}"
 
 step "OpenWebUI at $OWUI_URL"
 curl -sf --max-time 5 "$OWUI_URL/health" >/dev/null \
@@ -90,7 +90,7 @@ fi
 
 step "Pinning Net-Diag tools to model $MODEL"
 payload="$(cat <<JSON
-{"id":"$MODEL","base_model_id":null,"name":"$MODEL","meta":{"profile_image_url":"/static/favicon.png","description":null,"capabilities":{"vision":false,"file_upload":true,"web_search":false,"image_generation":false,"code_interpreter":false,"citations":true},"suggestion_prompts":null,"tags":[],"toolIds":["server:Server"]},"params":{},"access_control":null,"is_active":true}
+{"id":"$MODEL","base_model_id":null,"name":"$MODEL","meta":{"profile_image_url":"/static/favicon.png","description":null,"capabilities":{"vision":false,"file_upload":true,"web_search":false,"image_generation":false,"code_interpreter":false,"citations":true},"suggestion_prompts":null,"tags":[],"toolIds":["server:Server"]},"params":{"function_calling":"native"},"access_control":null,"is_active":true}
 JSON
 )"
 resp="$(curl -s "${AUTH[@]}" -X POST -d "$payload" "$OWUI_URL/api/v1/models/create" || true)"
