@@ -47,6 +47,13 @@ If PowerShell blocks the script ("running scripts is disabled"), launch it with:
 powershell -ExecutionPolicy Bypass -File .\openWebBuddy.ps1
 ```
 
+### Prefer to double-click?
+
+Double-clicking a `.ps1` only opens it in an editor - Windows will not run it that
+way. Double-click **`openWebBuddy.cmd`** instead: it runs the launcher for you with the
+right execution policy (pass `start`/`stop`/`status`/`restart` as an argument, or just
+double-click for `start`).
+
 ### First run only
 
 OpenWebUI starts with no accounts.
