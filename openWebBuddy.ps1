@@ -1,0 +1,256 @@
+<#
+    openWebBuddy.ps1 - Windows launcher for the offline Network Troubleshooting Assistant.
+
+      .\openWebBuddy.ps1            start Ollama + OpenWebUI + the net-diag MCP tool bridge,
+                                    then open a browser to the chat UI
+      .\openWebBuddy.ps1 stop       stop the MCP bridge and OpenWebUI (Ollama is left running -
+                                    it is a shared Windows service)
+      .\openWebBuddy.ps1 status     show what's running (exit 1 if anything is down)
+      .\openWebBuddy.ps1 restart    stop then start
+
+    Windows port of the original Linux 'openWebBuddy' bash launcher. Instead of systemd +
+    Docker it runs Ollama (native Windows app), OpenWebUI (pip package), and mcpo (pip
+    package) as plain background processes, all bound to 127.0.0.1. The Net-Diag tool server
+    and prompt suggestions are wired in by bootstrap-openwebui.ps1 through the API.
+#>
+[CmdletBinding()]
+param(
+    [ValidateSet('start', 'stop', 'restart', 'status')]
+    [string]$Command = 'start'
+)
+
+$ErrorActionPreference = 'Stop'
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+$Root = $PSScriptRoot
+
+# Optional machine-local overrides in .env (KEY=VALUE lines), e.g. MCPO_PORT=8100.
+$EnvFile = Join-Path $Root '.env'
+if (Test-Path $EnvFile) {
+    Get-Content $EnvFile | ForEach-Object {
+        if ($_ -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$') {
+            Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2]
+        }
+    }
+}
+
+$McpDir      = Join-Path $Root 'net-mcp'
+$VenvScripts = Join-Path $McpDir '.venv\Scripts'
+$Python      = Join-Path $VenvScripts 'python.exe'
+$Mcpo        = Join-Path $VenvScripts 'mcpo.exe'
+$OpenWebUI   = Join-Path $VenvScripts 'open-webui.exe'
+$Server      = Join-Path $McpDir 'net_mcp_server_win.py'
+
+$LogDir      = Join-Path $Root 'logs'
+$DataDir     = Join-Path $Root 'owui-data'
+
+$OllamaExe   = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'
+$OllamaUrl   = 'http://127.0.0.1:11434'
+$Model       = if ($env:MODEL) { $env:MODEL } else { 'llama3.2:1b' }
+
+$OwuiPort    = if ($env:OWUI_PORT) { $env:OWUI_PORT } else { '3000' }
+$OwuiUrl     = "http://127.0.0.1:$OwuiPort"
+$McpoPort    = if ($env:MCPO_PORT) { $env:MCPO_PORT } else { '8000' }
+
+# ---------------------------------------------------------------------------
+# Pretty output
+# ---------------------------------------------------------------------------
+function Step($m) { Write-Host "==> " -ForegroundColor Blue -NoNewline; Write-Host $m }
+function Ok($m)   { Write-Host "  " -NoNewline; Write-Host "OK " -ForegroundColor Green -NoNewline; Write-Host $m }
+function Warn($m) { Write-Host "  " -NoNewline; Write-Host "!  " -ForegroundColor Yellow -NoNewline; Write-Host $m }
+function Die($m)  { Write-Host "  " -NoNewline; Write-Host "x  " -ForegroundColor Red -NoNewline; Write-Host $m; exit 1 }
+
+# Poll until $Test (a scriptblock returning $true) succeeds, up to $TimeoutSec.
+# If $Proc is given and exits first, stop waiting immediately (fail fast on crash).
+function Wait-For([scriptblock]$Test, [int]$TimeoutSec, [System.Diagnostics.Process]$Proc = $null) {
+    $elapsed = 0
+    while ($elapsed -lt $TimeoutSec) {
+        try { if (& $Test) { return $true } } catch {}
+        if ($Proc -and $Proc.HasExited) { return $false }
+        Start-Sleep -Seconds 1
+        $elapsed++
+    }
+    return $false
+}
+
+function Test-Http($Url) {
+    try {
+        Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3 | Out-Null
+        return $true
+    } catch {
+        # A 4xx/5xx still means something is listening and answering HTTP.
+        return $null -ne $_.Exception.Response
+    }
+}
+
+function Get-PidFromFile($Path) {
+    if (Test-Path $Path) {
+        $p = (Get-Content $Path -Raw).Trim()
+        if ($p -match '^\d+$') { return [int]$p }
+    }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+# Component: Ollama
+# ---------------------------------------------------------------------------
+function Start-Ollama {
+    Step "Ollama model server"
+    if (Test-Http "$OllamaUrl/api/tags") {
+        Ok "already running"
+    } else {
+        if (-not (Test-Path $OllamaExe)) { Die "ollama.exe not found at $OllamaExe (install Ollama for Windows)" }
+        Start-Process -FilePath $OllamaExe -ArgumentList 'serve' -WindowStyle Hidden | Out-Null
+        if (-not (Wait-For { Test-Http "$OllamaUrl/api/tags" } 30)) { Die "ollama did not come up within 30s" }
+        Ok "started"
+    }
+    try {
+        $tags = (Invoke-WebRequest -Uri "$OllamaUrl/api/tags" -UseBasicParsing -TimeoutSec 5).Content
+        if ($tags -match [regex]::Escape($Model)) { Ok "model $Model available" }
+        else { Warn "model $Model not found - pull it with: ollama pull $Model" }
+    } catch { Warn "could not query models" }
+}
+
+# ---------------------------------------------------------------------------
+# Component: net-diag MCP bridge (mcpo -> OpenAPI tool server)
+# ---------------------------------------------------------------------------
+function Start-Mcpo {
+    Step "net-diag tool bridge (mcpo)"
+    if (Test-Http "http://127.0.0.1:$McpoPort/openapi.json") {
+        Ok "already running on :$McpoPort"
+        return
+    }
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    # 127.0.0.1, not 0.0.0.0: keep the diagnostic tools off the LAN - anyone who could
+    # reach this port could make the machine run pings/port scans, unauthenticated.
+    $mcpoArgs = @(
+        '--port', $McpoPort, '--host', '127.0.0.1',
+        '--name', 'net-diag',
+        '--description', 'Offline network diagnostic tools',
+        '--', $Python, $Server
+    )
+    $proc = Start-Process -FilePath $Mcpo -ArgumentList $mcpoArgs `
+        -RedirectStandardOutput (Join-Path $LogDir 'mcpo.log') `
+        -RedirectStandardError  (Join-Path $LogDir 'mcpo.err.log') `
+        -WindowStyle Hidden -PassThru
+    $proc.Id | Out-File -FilePath (Join-Path $LogDir 'mcpo.pid') -Encoding ascii -Force
+    if (-not (Wait-For { Test-Http "http://127.0.0.1:$McpoPort/openapi.json" } 25 $proc)) {
+        Die "mcpo did not come up - see $LogDir\mcpo.err.log"
+    }
+    try {
+        $spec = (Invoke-WebRequest -Uri "http://127.0.0.1:$McpoPort/openapi.json" -UseBasicParsing -TimeoutSec 5).Content | ConvertFrom-Json
+        $n = ($spec.paths | Get-Member -MemberType NoteProperty).Count
+        Ok "serving $n tools on :$McpoPort"
+    } catch { Ok "running on :$McpoPort" }
+}
+
+# ---------------------------------------------------------------------------
+# Component: OpenWebUI (native pip package)
+# ---------------------------------------------------------------------------
+function Start-Owui {
+    Step "OpenWebUI"
+    if (Test-Http "$OwuiUrl/health") {
+        Ok "already running"
+        return
+    }
+    New-Item -ItemType Directory -Force -Path $LogDir  | Out-Null
+    New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+
+    # First-boot seeding via simple env vars. The tool server, default model, and prompt
+    # suggestions are applied authoritatively by bootstrap-openwebui.ps1 through the API.
+    $env:DATA_DIR                        = $DataDir
+    $env:OLLAMA_BASE_URL                 = $OllamaUrl
+    $env:DEFAULT_MODELS                  = $Model
+    $env:ENABLE_FOLLOW_UP_GENERATION     = 'False'
+    $env:ENABLE_TAGS_GENERATION          = 'False'
+    $env:ENABLE_TITLE_GENERATION         = 'False'
+    $env:ENABLE_COMMUNITY_SHARING        = 'False'
+    $env:ENABLE_EVALUATION_ARENA_MODELS  = 'False'
+    $env:WEBUI_AUTH                       = 'True'
+
+    $owuiArgs = @('serve', '--host', '127.0.0.1', '--port', $OwuiPort)
+    $proc = Start-Process -FilePath $OpenWebUI -ArgumentList $owuiArgs `
+        -RedirectStandardOutput (Join-Path $LogDir 'owui.log') `
+        -RedirectStandardError  (Join-Path $LogDir 'owui.err.log') `
+        -WindowStyle Hidden -PassThru
+    $proc.Id | Out-File -FilePath (Join-Path $LogDir 'owui.pid') -Encoding ascii -Force
+
+    # First boot downloads an embedding model, so allow generous time.
+    if (-not (Wait-For { Test-Http "$OwuiUrl/health" } 240 $proc)) {
+        Die "OpenWebUI did not become reachable on $OwuiUrl - see $LogDir\owui.err.log (it may have crashed on startup)"
+    }
+    Ok "reachable at $OwuiUrl"
+}
+
+# ---------------------------------------------------------------------------
+# Process teardown
+# ---------------------------------------------------------------------------
+function Stop-Tracked($Name, $PidFile) {
+    Step $Name
+    $procId = Get-PidFromFile $PidFile
+    $stopped = $false
+    if ($procId) {
+        $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+        if ($p) {
+            # Kill the whole tree - uvicorn/mcpo spawn child workers.
+            taskkill /PID $procId /T /F *> $null
+            $stopped = $true
+        }
+    }
+    if (Test-Path $PidFile) { Remove-Item $PidFile -Force }
+    if ($stopped) { Ok "stopped" } else { Ok "already stopped" }
+}
+
+function Open-Browser {
+    Step "Opening chat"
+    Start-Process $OwuiUrl | Out-Null
+    Ok "launched browser at $OwuiUrl"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+function Invoke-Start {
+    Start-Ollama
+    Start-Owui
+    Start-Mcpo
+    Open-Browser
+    Write-Host ""
+    Write-Host "openWebBuddy is up." -ForegroundColor Green
+    Write-Host "  Chat:   $OwuiUrl"
+    Write-Host "  Tools:  http://127.0.0.1:$McpoPort (net-diag OpenAPI server)"
+    Write-Host "  Stop with: .\openWebBuddy.ps1 stop"
+    $dbFile = Join-Path $DataDir 'webui.db'
+    if (-not (Test-Path $dbFile)) {
+        Write-Host ""
+        Write-Host "First run: create the admin account in the browser, then run:" -ForegroundColor Yellow
+        Write-Host "  .\bootstrap-openwebui.ps1 <your-admin-email>"
+    }
+}
+
+function Invoke-Stop {
+    Stop-Tracked "net-diag tool bridge (mcpo)" (Join-Path $LogDir 'mcpo.pid')
+    Stop-Tracked "OpenWebUI"                    (Join-Path $LogDir 'owui.pid')
+    Step "Ollama model server"
+    Ok "left running (shared Windows service; stop it from the tray icon if you want it down)"
+    Write-Host ""
+    Write-Host "Stopped OpenWebUI and the tool bridge." -ForegroundColor Green
+}
+
+function Invoke-Status {
+    Step "Status"
+    $down = 0
+    if (Test-Http "$OllamaUrl/api/tags")                     { Ok "Ollama       running ($OllamaUrl)" }   else { Warn "Ollama       stopped"; $down = 1 }
+    if (Test-Http "$OwuiUrl/health")                          { Ok "OpenWebUI    running ($OwuiUrl)" }      else { Warn "OpenWebUI    stopped"; $down = 1 }
+    if (Test-Http "http://127.0.0.1:$McpoPort/openapi.json")  { Ok "net-diag MCP running (:$McpoPort)" }    else { Warn "net-diag MCP stopped"; $down = 1 }
+    exit $down
+}
+
+switch ($Command) {
+    'start'   { Invoke-Start }
+    'stop'    { Invoke-Stop }
+    'restart' { Invoke-Stop; Write-Host ""; Invoke-Start }
+    'status'  { Invoke-Status }
+}
