@@ -4,6 +4,10 @@
 # Runtime state
 logs/
 
+# OpenWebUI runtime data (database, secret key, uploads, vector db) — never commit
+owui-data/
+.webui_secret_key
+
 # Machine-local overrides (MCPO_PORT, ...) — differs per machine, never shared
 .env
 
