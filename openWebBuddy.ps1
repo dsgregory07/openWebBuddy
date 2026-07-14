@@ -125,10 +125,12 @@ function Start-Mcpo {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
     # 127.0.0.1, not 0.0.0.0: keep the diagnostic tools off the LAN - anyone who could
     # reach this port could make the machine run pings/port scans, unauthenticated.
+    # The description needs embedded quotes: Start-Process joins -ArgumentList with spaces
+    # and does not re-quote elements, so without them mcpo receives only 'Offline'.
     $mcpoArgs = @(
         '--port', $McpoPort, '--host', '127.0.0.1',
         '--name', 'net-diag',
-        '--description', 'Offline network diagnostic tools',
+        '--description', '"Offline network diagnostic tools"',
         '--', $Python, $Server
     )
     $proc = Start-Process -FilePath $Mcpo -ArgumentList $mcpoArgs `
@@ -169,6 +171,11 @@ function Start-Owui {
     $env:ENABLE_COMMUNITY_SHARING        = 'False'
     $env:ENABLE_EVALUATION_ARENA_MODELS  = 'False'
     $env:WEBUI_AUTH                       = 'True'
+    # Cap the native tool-calling loop (OpenWebUI's default is 256 - a runaway loop on a
+    # CPU-bound local model could grind for hours). Override in .env if needed.
+    if (-not $env:CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS) {
+        $env:CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS = '12'
+    }
 
     $owuiArgs = @('serve', '--host', '127.0.0.1', '--port', $OwuiPort)
     $proc = Start-Process -FilePath $OpenWebUI -ArgumentList $owuiArgs `

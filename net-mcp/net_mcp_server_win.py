@@ -32,12 +32,67 @@ def run(cmd: list[str], timeout: int = TIMEOUT) -> str:
         return f"error: command timed out after {timeout}s"
 
 
-def run_ps(script: str, timeout: int = TIMEOUT) -> str:
-    """Run a PowerShell snippet, forcing UTF-8 output so parsing is stable."""
+def run_ps(script: str, timeout: int = 30) -> str:
+    """Run a PowerShell snippet, forcing UTF-8 output so parsing is stable.
+
+    Default timeout is higher than TIMEOUT: powershell.exe startup alone can take
+    >10s when a local model is saturating the CPU during inference.
+    """
     full = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;" + script
     return run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", full], timeout=timeout
     )
+
+
+def _fmt_bytes(n: int) -> str:
+    x = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if x < 1024 or unit == "TB":
+            return f"{int(x)} B" if unit == "B" else f"{x:.1f} {unit}"
+        x /= 1024
+    return f"{x:.1f} TB"
+
+
+def _summarize_ping(raw: str) -> str:
+    """Boil Windows ping output down to a couple of lines; pass through anything unparseable."""
+    stats = re.search(
+        r"Packets:\s*Sent\s*=\s*(\d+),\s*Received\s*=\s*(\d+),\s*Lost\s*=\s*(\d+)"
+        r"\s*\((\d+(?:\.\d+)?)%\s*loss\)",
+        raw,
+    )
+    if not stats:
+        return raw
+    sent, received, _lost, loss_pct = stats.groups()
+    target = re.search(r"Pinging\s+(\S+?)(?:\s+\[(\S+)\])?\s+with", raw)
+    if target:
+        label = f"{target.group(1)} [{target.group(2)}]" if target.group(2) else target.group(1)
+    else:
+        label = "host"
+    line = f"Ping {label}: sent={sent} received={received} loss={loss_pct}%"
+    rtt = re.search(r"Minimum\s*=\s*(\d+)ms,\s*Maximum\s*=\s*(\d+)ms,\s*Average\s*=\s*(\d+)ms", raw)
+    if rtt:
+        line += f", rtt min/avg/max = {rtt.group(1)}/{rtt.group(3)}/{rtt.group(2)} ms"
+    problems = []
+    for pat, msg in (
+        (r"Request timed out", "request timed out"),
+        (r"Destination host unreachable", "destination host unreachable"),
+        (r"General failure", "general failure (local TCP/IP stack or adapter problem)"),
+        (r"transmit failed", "transmit failed (local adapter problem)"),
+        (r"TTL expired", "TTL expired in transit (possible routing loop)"),
+    ):
+        n = len(re.findall(pat, raw, re.IGNORECASE))
+        if n:
+            problems.append(f"{msg} x{n}")
+    if problems:
+        line += "\nProblems: " + "; ".join(problems)
+    # Windows counts "Destination host unreachable" replies as received packets.
+    if int(received) > 0 and re.search(r"Destination host unreachable", raw, re.IGNORECASE):
+        line += "\nNote: 'unreachable' replies count as received - treat this ping as FAILED."
+    return line
+
+
+# tools below use run()/run_ps() and return compact summaries; anything unparseable
+# falls through as the raw command output so no information is ever lost.
 
 
 def default_gateway() -> str | None:
@@ -63,24 +118,34 @@ def check_gateway_reachable() -> str:
     gw = default_gateway()
     if not gw:
         return "No default gateway configured — check that an interface is up and has an IP (see list_network_interfaces)."
-    result = run(["ping", "-n", "4", "-w", "2000", gw])
-    return f"Gateway: {gw}\n{result}"
+    summary = _summarize_ping(run(["ping", "-n", "4", "-w", "2000", gw]))
+    low = summary.lower()
+    if "loss=0%" in summary and "unreachable" not in low:
+        verdict = "VERDICT: LAN OK - the router answers."
+    elif "loss=100%" in summary or "unreachable" in low:
+        verdict = "VERDICT: router NOT reachable - the problem is on the LAN side (adapter, cable/Wi-Fi link, or the router itself), not the internet."
+    else:
+        verdict = "VERDICT: partial packet loss to the router - flaky LAN link (cable/Wi-Fi/interference)."
+    return f"Gateway: {gw}\n{summary}\n{verdict}"
 
 
 # NOTE: intended for probing the user's own LAN/router; not restricted to any allowlist since this is a
 # single-host offline diagnostic tool, not a multi-tenant service.
 @mcp.tool()
 def ping_host(host: str, count: int = 4) -> str:
-    """Ping a host (IP or hostname) to check reachability and latency. Use for the router, LAN devices, or any address you have permission to probe."""
+    """Ping a host (IP or hostname) to check reachability and latency. Use for the router, LAN devices, or any address you have permission to probe. Returns a one-line loss/latency summary."""
     count = max(1, min(count, 10))
-    return run(["ping", "-n", str(count), "-w", "2000", host], timeout=count * 3 + 10)
+    return _summarize_ping(run(["ping", "-n", str(count), "-w", "2000", host], timeout=count * 3 + 10))
 
 
 @mcp.tool()
 def traceroute_host(host: str) -> str:
-    """Trace the network path (hop by hop) to a host. Useful to see where connectivity breaks between this machine and the router/internet."""
+    """Trace the network path (hop by hop) to a host. Useful to see where connectivity breaks between this machine and the router/internet. One line per hop; '*' means that hop did not answer."""
     # tracert ships with Windows; -w is per-hop timeout (ms), -h caps the hop count.
-    return run(["tracert", "-w", "2000", "-h", "15", host], timeout=90)
+    raw = run(["tracert", "-w", "2000", "-h", "15", host], timeout=90)
+    # tracert output is whitespace-padded; collapse it so it costs fewer tokens to read.
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw.splitlines()]
+    return "\n".join(ln for ln in lines if ln)
 
 
 @mcp.tool()
@@ -96,15 +161,21 @@ def dns_lookup(hostname: str) -> str:
 
 @mcp.tool()
 def list_network_interfaces() -> str:
-    """List local network interfaces, their state (up/down), and assigned IP addresses. Use to check whether this machine has a valid IP/link before blaming the router."""
-    return run_ps(
+    """List local network interfaces with state (up/down), link speed, and assigned IP addresses. Use to check whether this machine has a valid IP/link before blaming the router. An adapter that is Up with only a 169.254.x.x IP means DHCP failed."""
+    out = run_ps(
         "Get-NetAdapter -ErrorAction SilentlyContinue | Sort-Object ifIndex | ForEach-Object {"
         " $ips = (Get-NetIPAddress -InterfaceIndex $_.ifIndex -ErrorAction SilentlyContinue |"
         " Where-Object {$_.AddressFamily -eq 'IPv4' -or $_.AddressFamily -eq 'IPv6'} |"
         " ForEach-Object { \"$($_.IPAddress)/$($_.PrefixLength)\" }) -join ' ';"
-        " '{0,-22} {1,-8} {2}' -f $_.Name, $_.Status, $ips"
+        " '{0,-22} {1,-8} {2,-10} {3}' -f $_.Name, $_.Status, $_.LinkSpeed, $ips"
         " } | Out-String"
     )
+    if out.startswith("error:") or out.startswith("[exit"):
+        return out
+    lines = [ln.rstrip() for ln in out.splitlines() if ln.strip()]
+    if not lines:
+        return out
+    return "name / status / speed / IPs\n" + "\n".join(lines)
 
 
 @mcp.tool()
@@ -112,7 +183,36 @@ def arp_scan_lan() -> str:
     """Discover live devices on the LAN (MAC + IP) from the local ARP table. Requires being on the LAN; does not need internet. Useful to confirm the router and other devices are actually present on the network during an outage."""
     # Windows has no built-in arp-scan; the ARP cache (`arp -a`) shows hosts this
     # machine has recently talked to and needs no admin rights.
-    return run(["arp", "-a"])
+    raw = run(["arp", "-a"])
+    entries = []  # (local interface IP, host IP, MAC, type)
+    iface = "?"
+    for line in raw.splitlines():
+        m_if = re.match(r"\s*Interface:\s*(\S+)", line)
+        if m_if:
+            iface = m_if.group(1)
+            continue
+        m = re.match(r"\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})\s+(\w+)", line)
+        if not m:
+            continue
+        ip, mac, typ = m.groups()
+        # Drop multicast/broadcast noise; keep real hosts.
+        if int(ip.split(".")[0]) >= 224 or ip.endswith(".255") or mac.lower() == "ff-ff-ff-ff-ff-ff":
+            continue
+        entries.append((iface, ip, mac, typ))
+    if not entries:
+        return raw
+    lines = []
+    last_iface = None
+    for iface, ip, mac, typ in entries:
+        if iface != last_iface:
+            lines.append(f"Interface {iface}:")
+            last_iface = iface
+        lines.append(f"  {ip}  {mac}  ({typ})")
+    lines.append(
+        f"{len(entries)} host(s) in the ARP cache (multicast/broadcast omitted). "
+        "Only devices this machine recently talked to appear here."
+    )
+    return "\n".join(lines)
 
 
 def _expand_ports(spec: str, cap: int = 256) -> list[int]:
@@ -266,18 +366,38 @@ def wifi_status() -> str:
     out = run(["netsh", "wlan", "show", "interfaces"])
     if "no wireless interface" in out.lower() or "not running" in out.lower():
         return "No wireless interfaces found (this machine may be on Ethernet only, or the WLAN service is off)."
+    kv = {}
+    for line in out.splitlines():
+        m = re.match(r"\s*([^:]+?)\s*:\s*(.+?)\s*$", line)
+        if m:
+            kv.setdefault(m.group(1), m.group(2))
+    state = kv.get("State")
+    if not state:
+        return out  # unexpected shape - hand back the raw output
+    if state.lower() != "connected":
+        return f"Wi-Fi interface '{kv.get('Name', '?')}' is {state} - not connected to any network."
+    lines = [
+        f"Wi-Fi: connected to SSID '{kv.get('SSID', '?')}' "
+        f"(channel {kv.get('Channel', '?')}, {kv.get('Radio type', '?')}, BSSID {kv.get('BSSID', '?')})"
+    ]
     # Windows reports signal as a quality percentage rather than dBm.
-    sig = re.search(r"Signal\s*:\s*(\d+)%", out)
+    sig = re.search(r"(\d+)%", kv.get("Signal", ""))
     if sig:
         pct = int(sig.group(1))
         quality = (
             "excellent" if pct >= 75 else
             "good" if pct >= 50 else
             "fair" if pct >= 30 else
-            "weak — expect slowness/drops"
+            "weak - expect slowness/drops"
         )
-        out += f"\nSignal assessment: {pct}% ({quality})"
-    return out
+        lines.append(f"Signal: {pct}% ({quality})")
+    rx = kv.get("Receive rate (Mbps)")
+    tx = kv.get("Transmit rate (Mbps)")
+    if rx or tx:
+        lines.append(f"Rates: receive {rx or '?'} Mbps / transmit {tx or '?'} Mbps")
+    if kv.get("Authentication"):
+        lines.append(f"Auth: {kv['Authentication']}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -315,46 +435,108 @@ def http_check(url: str) -> str:
 
 @mcp.tool()
 def listening_ports() -> str:
-    """List TCP/UDP ports this machine is listening on (local services). Use to check whether an expected local service (SSH, web server, etc.) is actually running and bound."""
+    """List TCP/UDP ports this machine is listening on (local services), grouped by bind address. Use to check whether an expected local service (SSH, web server, etc.) is actually running and bound."""
     tcp = run_ps(
         "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |"
-        " Sort-Object LocalPort |"
-        " ForEach-Object { 'TCP {0,-24} :{1}' -f $_.LocalAddress, $_.LocalPort } |"
-        " Get-Unique | Out-String"
+        " ForEach-Object { $_.LocalAddress + '|' + $_.LocalPort }"
     )
     udp = run_ps(
         "Get-NetUDPEndpoint -ErrorAction SilentlyContinue |"
-        " Sort-Object LocalPort |"
-        " ForEach-Object { 'UDP {0,-24} :{1}' -f $_.LocalAddress, $_.LocalPort } |"
-        " Get-Unique | Out-String"
+        " ForEach-Object { $_.LocalAddress + '|' + $_.LocalPort }"
     )
-    both = "\n".join(s for s in (tcp.strip(), udp.strip()) if s)
-    return both or run(["netstat", "-an"])
+
+    def _group(raw: str, proto: str) -> list[str]:
+        by_addr: dict[str, set[int]] = {}
+        for line in raw.splitlines():
+            if "|" not in line:
+                continue
+            addr, _, port = line.rpartition("|")
+            try:
+                by_addr.setdefault(addr.strip(), set()).add(int(port))
+            except ValueError:
+                continue
+        out = []
+        for addr in sorted(by_addr):
+            ports = sorted(by_addr[addr])
+            shown = ", ".join(str(p) for p in ports[:40])
+            extra = f" (+{len(ports) - 40} more)" if len(ports) > 40 else ""
+            out.append(f"{proto} on {addr}: {shown}{extra}")
+        return out
+
+    lines = _group(tcp, "TCP") + _group(udp, "UDP")
+    if not lines:
+        return run(["netstat", "-an"])
+    lines.append("(0.0.0.0 / :: = listening on all interfaces; 127.0.0.1 / ::1 = loopback only)")
+    return "\n".join(lines)
 
 
 @mcp.tool()
 def show_routes() -> str:
-    """Show the IPv4 routing table. Use to spot missing default routes, wrong metrics, or VPN/route conflicts when traffic goes to the wrong place."""
-    return run(["route", "print", "-4"])
+    """Summarize the IPv4 routing table: default route(s), on-link subnets, and any gateway routes. Use to spot missing default routes, wrong metrics, or VPN/route conflicts when traffic goes to the wrong place."""
+    raw = run_ps(
+        "Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |"
+        " ForEach-Object { $_.DestinationPrefix + '|' + $_.NextHop + '|' + $_.InterfaceAlias + '|' + $_.RouteMetric }"
+    )
+    rows = [ln.split("|") for ln in raw.splitlines() if ln.count("|") == 3]
+    if not rows:
+        return run(["route", "print", "-4"])
+    defaults, subnets, gateway_routes = [], [], []
+    omitted = 0
+    for dest, nexthop, iface, metric in rows:
+        if dest == "0.0.0.0/0":
+            defaults.append(f"0.0.0.0/0 via {nexthop} ({iface}, metric {metric})")
+        elif dest.startswith("127.") or re.match(r"2(2[4-9]|3\d|4\d|5[0-5])\.", dest):
+            omitted += 1  # loopback/multicast/broadcast noise
+        elif nexthop == "0.0.0.0":
+            if dest.endswith("/32"):
+                omitted += 1  # on-link host routes (own IP, subnet broadcast)
+            else:
+                subnets.append(f"{dest} ({iface})")
+        else:
+            gateway_routes.append(f"{dest} via {nexthop} ({iface}, metric {metric})")
+    lines = []
+    if defaults:
+        lines.append("Default route: " + "; ".join(defaults))
+    else:
+        lines.append("NO DEFAULT ROUTE - this machine has no path to the internet (DHCP failure or misconfiguration).")
+    if subnets:
+        lines.append("On-link subnets: " + ", ".join(subnets))
+    if gateway_routes:
+        lines.append("Other routes via a gateway:\n  " + "\n  ".join(gateway_routes))
+    if omitted:
+        lines.append(f"({omitted} loopback/multicast/broadcast/host entries omitted)")
+    return "\n".join(lines)
 
 
 @mcp.tool()
 def interface_stats(interface: str = "") -> str:
-    """Show packet/error/drop counters for network interfaces. Rising errors or drops indicate a bad cable, driver issue, or interference. Leave `interface` empty for all interfaces."""
-    if interface:
-        script = (
-            f"Get-NetAdapterStatistics -Name '{interface}' -ErrorAction SilentlyContinue |"
-            " Format-List Name,ReceivedBytes,ReceivedUnicastPackets,ReceivedDiscardedPackets,"
-            "ReceivedPacketErrors,SentBytes,SentUnicastPackets,OutboundDiscardedPackets,"
-            "OutboundPacketErrors | Out-String"
-        )
-    else:
-        script = (
-            "Get-NetAdapterStatistics -ErrorAction SilentlyContinue |"
-            " Format-Table Name,ReceivedBytes,ReceivedPacketErrors,ReceivedDiscardedPackets,"
-            "SentBytes,OutboundPacketErrors,OutboundDiscardedPackets -AutoSize | Out-String"
-        )
-    return run_ps(script)
+    """Show packet/error/drop counters for network interfaces, one line per adapter. Rising errors or drops indicate a bad cable, driver issue, or interference. Leave `interface` empty for all interfaces."""
+    sel = f" -Name '{interface}'" if interface else ""
+    raw = run_ps(
+        "Get-NetAdapterStatistics" + sel + " -ErrorAction SilentlyContinue |"
+        " ForEach-Object { $_.Name + '|' + $_.ReceivedBytes + '|' + $_.ReceivedPacketErrors"
+        " + '|' + $_.ReceivedDiscardedPackets + '|' + $_.SentBytes + '|' + $_.OutboundPacketErrors"
+        " + '|' + $_.OutboundDiscardedPackets }"
+    )
+    rows = [ln.split("|") for ln in raw.splitlines() if ln.count("|") == 6]
+    if not rows:
+        return raw or f"No statistics available{' for ' + interface if interface else ''} (adapter down or name wrong — see list_network_interfaces)."
+    lines = []
+    issues = False
+    for name, rxb, rxe, rxd, txb, txe, txd in rows:
+        try:
+            lines.append(
+                f"{name}: rx {_fmt_bytes(int(rxb))} (errors {rxe}, drops {rxd}), "
+                f"tx {_fmt_bytes(int(txb))} (errors {txe}, drops {txd})"
+            )
+            issues = issues or any(int(x) for x in (rxe, rxd, txe, txd))
+        except ValueError:
+            lines.append(f"{name}: rx {rxb} B (errors {rxe}, drops {rxd}), tx {txb} B (errors {txe}, drops {txd})")
+    lines.append(
+        "Non-zero error/drop counters suggest a bad cable, driver problem, or interference."
+        if issues else "No packet errors or drops on any listed adapter."
+    )
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

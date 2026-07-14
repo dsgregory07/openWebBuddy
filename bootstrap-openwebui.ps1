@@ -6,12 +6,20 @@
     Wiring the Net-Diag tools to the model takes an authenticated API call, and nothing
     can authenticate until the admin account exists. So, once: open the chat, create the
     admin account in the browser, then run this with that account's email. It prompts for
-    the password and signs in. Safe to re-run.
+    the password and signs in (or reads $env:OWUI_PASSWORD).
+
+    Safe to re-run: if the model record already exists it is UPDATED in place, so re-run
+    this after changing MODEL in .env or after pulling a new model. It pins the Net-Diag
+    tools, enables native function calling, and sets the agentic system prompt, context
+    size, and prompt suggestions on the model.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [string]$Email
+    [string]$Email,
+    # Optional: configure a specific model instead of the .env MODEL (e.g. to also
+    # set up a fallback model record: .\bootstrap-openwebui.ps1 you@mail -Model llama3.2:1b)
+    [string]$Model = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,7 +37,9 @@ if (Test-Path $EnvFile) {
 $OwuiPort = if ($env:OWUI_PORT) { $env:OWUI_PORT } else { '3000' }
 $OwuiUrl  = if ($env:OWUI_URL)  { $env:OWUI_URL }  else { "http://127.0.0.1:$OwuiPort" }
 $McpoPort = if ($env:MCPO_PORT) { $env:MCPO_PORT } else { '8000' }
-$Model    = if ($env:MODEL)     { $env:MODEL }     else { 'llama3.2:1b' }
+if (-not $Model) {
+    $Model = if ($env:MODEL) { $env:MODEL } else { 'llama3.2:1b' }
+}
 
 function Step($m) { Write-Host "==> " -ForegroundColor Blue -NoNewline; Write-Host $m }
 function Ok($m)   { Write-Host "  " -NoNewline; Write-Host "OK " -ForegroundColor Green -NoNewline; Write-Host $m }
@@ -78,35 +88,94 @@ try {
     Ok "tool server 'Server' -> http://127.0.0.1:$McpoPort"
 } catch { Die "could not register the tool server: $($_.Exception.Message)" }
 
-Step "Pinning Net-Diag tools to model $Model"
+Step "Configuring model $Model for agentic troubleshooting"
+
+# Per-model system prompt: makes the model plan, chain tools, and end with a diagnosis.
+# Keep this ASCII-only (see WINDOWS.md).
+$SystemPrompt = @'
+You are an autonomous network troubleshooting agent running locally on this machine. You diagnose problems by calling diagnostic tools; never guess when a tool can check.
+
+Method:
+1. Think about which layer most likely explains the symptom: local adapter -> Wi-Fi/link -> gateway/router -> DNS -> WAN/internet -> specific service.
+2. Call one tool, read its result, then pick the next tool based on what you learned.
+3. For 'internet is down' reports, a good chain is: list_network_interfaces, then check_gateway_reachable, then check_internet, then dns_server_check or traceroute_host depending on what failed.
+4. Keep investigating until you can state a diagnosis; most problems need 2-6 tool calls. Never ask the user for permission to run a tool - just run it.
+5. If a tool fails or times out, note that and try a different tool instead of repeating the same call.
+
+When you are confident, stop calling tools and answer with exactly three sections:
+DIAGNOSIS: one or two sentences naming the failing layer/component.
+EVIDENCE: the key tool results that support it.
+NEXT STEPS: concrete actions for the user, most likely fix first.
+'@
+
 $modelPayload = @{
     id = $Model; base_model_id = $null; name = $Model
     meta = @{
-        profile_image_url = "/static/favicon.png"; description = $null
-        capabilities = @{ vision = $false; file_upload = $true; web_search = $false; image_generation = $false; code_interpreter = $false; citations = $true }
-        suggestion_prompts = $null; tags = @(); toolIds = @("server:Server")
+        profile_image_url = "/static/favicon.png"
+        description = "Offline network troubleshooter - diagnoses LAN/Wi-Fi/DNS/WAN problems with local tools"
+        # builtin_tools=false matters: otherwise OpenWebUI injects its own built-in tools
+        # (notes, web search, ...) next to the Net-Diag tools, and small local models
+        # wander off calling replace_note_content instead of diagnosing the network.
+        capabilities = @{ vision = $false; file_upload = $true; web_search = $false; image_generation = $false; code_interpreter = $false; citations = $true; builtin_tools = $false }
+        suggestion_prompts = @(
+            @{ title = @("My internet is down", "figure out why"); content = "My internet is down - figure out why and tell me how to fix it." }
+            @{ title = @("Is my router OK?", "run a quick audit"); content = "Run a quick audit of my router - is it reachable and are any risky ports open?" }
+            @{ title = @("Why is Wi-Fi slow?", "check signal and errors"); content = "My Wi-Fi feels slow - check the signal, link rates, and interface errors." }
+            @{ title = @("Is DNS broken?", "test the resolvers"); content = "Websites will not load by name - check whether DNS is the problem." }
+        )
+        tags = @(); toolIds = @("server:Server")
     }
-    params = @{ function_calling = "native" }
-    access_control = $null; is_active = $true
+    params = @{
+        function_calling = "native"   # real multi-round tool calls via Ollama /api/chat
+        system = $SystemPrompt
+        num_ctx = 8192                # room for tool schemas + several tool-result rounds
+        temperature = 0.2             # keep tool selection deterministic
+    }
+    access_grants = @(); is_active = $true
 }
+$modelBody = $modelPayload | ConvertTo-Json -Depth 10
+
+# Update in place when the record exists so re-runs pick up prompt/param changes.
+$exists = $false
 try {
-    $resp = Invoke-RestMethod -Uri "$OwuiUrl/api/v1/models/create" -Method Post `
-        -Headers $headers -ContentType 'application/json' `
-        -Body ($modelPayload | ConvertTo-Json -Depth 10)
-    Ok "model record created with Net-Diag tools pinned"
-} catch {
-    if ("$($_.Exception.Message)" -match 'taken|already') { Ok "model record already exists - leaving it as is" }
-    else { Die "models/create failed: $($_.Exception.Message)" }
-}
+    $m = Invoke-RestMethod -Uri "$OwuiUrl/api/v1/models/model?id=$Model" -Method Get -Headers $headers
+    if ($m -and $m.id) { $exists = $true }
+} catch {}
+try {
+    if ($exists) {
+        Invoke-RestMethod -Uri "$OwuiUrl/api/v1/models/model/update" -Method Post `
+            -Headers $headers -ContentType 'application/json' -Body $modelBody | Out-Null
+        Ok "model record updated (tools, native function calling, agentic prompt, num_ctx)"
+    } else {
+        Invoke-RestMethod -Uri "$OwuiUrl/api/v1/models/create" -Method Post `
+            -Headers $headers -ContentType 'application/json' -Body $modelBody | Out-Null
+        Ok "model record created (tools, native function calling, agentic prompt, num_ctx)"
+    }
+} catch { Die "model create/update failed: $($_.Exception.Message)" }
 
 Step "Setting default model to $Model"
+# Dedicated endpoint (POST /configs/models) - the old whole-config export/import
+# round-trip could fail without actually persisting ui.default_models.
 try {
-    $cfg = Invoke-RestMethod -Uri "$OwuiUrl/api/v1/configs/export" -Method Get -Headers $headers
-    if (-not $cfg.ui) { $cfg | Add-Member -NotePropertyName ui -NotePropertyValue (@{}) -Force }
-    $cfg.ui | Add-Member -NotePropertyName default_models -NotePropertyValue $Model -Force
-    Invoke-RestMethod -Uri "$OwuiUrl/api/v1/configs/import" -Method Post `
+    $mcfg = $null
+    try { $mcfg = Invoke-RestMethod -Uri "$OwuiUrl/api/v1/configs/models" -Method Get -Headers $headers } catch {}
+    # Values must be plain variables: an `if` statement used directly as a hashtable
+    # value makes PS 5.1's ConvertTo-Json render an empty array as {} instead of [],
+    # which the API rejects with 422.
+    $pinned    = $null
+    $orderList = @()
+    if ($mcfg) {
+        $pinned = $mcfg.DEFAULT_PINNED_MODELS
+        if ($mcfg.MODEL_ORDER_LIST) { $orderList = @($mcfg.MODEL_ORDER_LIST) }
+    }
+    $modelsCfg = @{
+        DEFAULT_MODELS        = $Model
+        DEFAULT_PINNED_MODELS = $pinned
+        MODEL_ORDER_LIST      = $orderList
+    }
+    Invoke-RestMethod -Uri "$OwuiUrl/api/v1/configs/models" -Method Post `
         -Headers $headers -ContentType 'application/json' `
-        -Body (@{ config = $cfg } | ConvertTo-Json -Depth 20) | Out-Null
+        -Body ($modelsCfg | ConvertTo-Json -Depth 10) | Out-Null
     Ok "submitted"
 } catch { Die "could not set default model: $($_.Exception.Message)" }
 
@@ -117,12 +186,16 @@ try {
     $toolIds = $m.meta.toolIds -join ','
     if ($toolIds -match 'server:Server') { Ok "tools pinned to $Model (toolIds: $toolIds)" }
     else { Write-Host "  x  tool pinning not confirmed (got: '$toolIds')" -ForegroundColor Red; $fail = 1 }
-} catch { Write-Host "  x  could not verify tool pinning" -ForegroundColor Red; $fail = 1 }
+    if ($m.params.system -match 'DIAGNOSIS') { Ok "agentic system prompt set" }
+    else { Write-Host "  x  system prompt not confirmed" -ForegroundColor Red; $fail = 1 }
+    if ("$($m.params.function_calling)" -eq 'native') { Ok "native function calling enabled" }
+    else { Write-Host "  x  function_calling is '$($m.params.function_calling)', expected 'native'" -ForegroundColor Red; $fail = 1 }
+} catch { Write-Host "  x  could not verify model config" -ForegroundColor Red; $fail = 1 }
 
 try {
-    $cfg2 = Invoke-RestMethod -Uri "$OwuiUrl/api/v1/configs/export" -Method Get -Headers $headers
-    if ($cfg2.ui.default_models -eq $Model) { Ok "default model is $Model" }
-    else { Write-Host "  x  default model not confirmed (got: '$($cfg2.ui.default_models)')" -ForegroundColor Red; $fail = 1 }
+    $cfg2 = Invoke-RestMethod -Uri "$OwuiUrl/api/v1/configs/models" -Method Get -Headers $headers
+    if ($cfg2.DEFAULT_MODELS -eq $Model) { Ok "default model is $Model" }
+    else { Write-Host "  x  default model not confirmed (got: '$($cfg2.DEFAULT_MODELS)')" -ForegroundColor Red; $fail = 1 }
 } catch { Write-Host "  x  could not verify default model" -ForegroundColor Red; $fail = 1 }
 
 Write-Host ""
