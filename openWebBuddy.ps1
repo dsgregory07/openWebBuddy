@@ -5,6 +5,8 @@
                                     then open a browser to the chat UI
       .\openWebBuddy.ps1 stop       stop the MCP bridge and OpenWebUI (Ollama is left running -
                                     it is a shared Windows service)
+      .\openWebBuddy.ps1 stop-all   graceful full shutdown - stop the MCP bridge, OpenWebUI,
+                                    AND Ollama, so nothing is left consuming resources
       .\openWebBuddy.ps1 status     show what's running (exit 1 if anything is down)
       .\openWebBuddy.ps1 restart    stop then start
 
@@ -15,7 +17,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('start', 'stop', 'restart', 'status')]
+    [ValidateSet('start', 'stop', 'stop-all', 'restart', 'status')]
     [string]$Command = 'start'
 )
 
@@ -194,20 +196,54 @@ function Start-Owui {
 # ---------------------------------------------------------------------------
 # Process teardown
 # ---------------------------------------------------------------------------
+# Stop a process (and its whole tree) as cleanly as possible. Returns $true if it was
+# running when we started. Windowed apps (e.g. the Ollama tray) are asked to close first
+# and given a grace window; background console services (OpenWebUI, mcpo, ollama serve)
+# have no window to receive that, so they go straight to the forced tree-kill.
+# taskkill is routed through cmd with its output swallowed so its stderr can never become
+# a terminating NativeCommandError under ErrorActionPreference = Stop.
+function Stop-Tree([int]$RootPid, [int]$GraceSec = 5) {
+    $proc = Get-Process -Id $RootPid -ErrorAction SilentlyContinue
+    if (-not $proc) { return $false }
+    $askedNicely = $false
+    try {
+        if ($proc.MainWindowHandle -ne [IntPtr]::Zero) { $null = $proc.CloseMainWindow(); $askedNicely = $true }
+    } catch {}
+    if ($askedNicely) {
+        $waited = 0
+        while ($waited -lt ($GraceSec * 2)) {
+            if (-not (Get-Process -Id $RootPid -ErrorAction SilentlyContinue)) { return $true }
+            Start-Sleep -Milliseconds 500
+            $waited++
+        }
+    }
+    cmd /c "taskkill /PID $RootPid /T /F >nul 2>nul"
+    return $true
+}
+
 function Stop-Tracked($Name, $PidFile) {
     Step $Name
     $procId = Get-PidFromFile $PidFile
     $stopped = $false
-    if ($procId) {
-        $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
-        if ($p) {
-            # Kill the whole tree - uvicorn/mcpo spawn child workers.
-            taskkill /PID $procId /T /F *> $null
-            $stopped = $true
-        }
-    }
+    if ($procId) { $stopped = Stop-Tree $procId }
     if (Test-Path $PidFile) { Remove-Item $PidFile -Force }
     if ($stopped) { Ok "stopped" } else { Ok "already stopped" }
+}
+
+# Full graceful teardown of Ollama (tray app + serve + model-runner children). Ollama
+# has no PID file - it is a shared app - so find it by process name.
+function Stop-Ollama {
+    Step "Ollama model server"
+    $procs = @(Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessName -like 'ollama*' })
+    if ($procs.Count -eq 0) { Ok "already stopped"; return }
+    foreach ($p in $procs) { Stop-Tree $p.Id | Out-Null }
+    # Sweep any stragglers the tree-kill missed (separate process groups).
+    Start-Sleep -Milliseconds 500
+    Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessName -like 'ollama*' } |
+        ForEach-Object { cmd /c "taskkill /PID $($_.Id) /T /F >nul 2>nul" }
+    Ok "stopped"
 }
 
 function Open-Browser {
@@ -241,9 +277,18 @@ function Invoke-Stop {
     Stop-Tracked "net-diag tool bridge (mcpo)" (Join-Path $LogDir 'mcpo.pid')
     Stop-Tracked "OpenWebUI"                    (Join-Path $LogDir 'owui.pid')
     Step "Ollama model server"
-    Ok "left running (shared Windows service; stop it from the tray icon if you want it down)"
+    Ok "left running (shared Windows app; use 'stop-all' to stop it too)"
     Write-Host ""
     Write-Host "Stopped OpenWebUI and the tool bridge." -ForegroundColor Green
+}
+
+function Invoke-StopAll {
+    Stop-Tracked "net-diag tool bridge (mcpo)" (Join-Path $LogDir 'mcpo.pid')
+    Stop-Tracked "OpenWebUI"                    (Join-Path $LogDir 'owui.pid')
+    Stop-Ollama
+    Write-Host ""
+    Write-Host "Full stop - OpenWebUI, the tool bridge, and Ollama are all down." -ForegroundColor Green
+    Write-Host "Your account, tools, and uploads are safe in owui-data and will be there on restart."
 }
 
 function Invoke-Status {
@@ -256,8 +301,9 @@ function Invoke-Status {
 }
 
 switch ($Command) {
-    'start'   { Invoke-Start }
-    'stop'    { Invoke-Stop }
-    'restart' { Invoke-Stop; Write-Host ""; Invoke-Start }
-    'status'  { Invoke-Status }
+    'start'    { Invoke-Start }
+    'stop'     { Invoke-Stop }
+    'stop-all' { Invoke-StopAll }
+    'restart'  { Invoke-Stop; Write-Host ""; Invoke-Start }
+    'status'   { Invoke-Status }
 }
