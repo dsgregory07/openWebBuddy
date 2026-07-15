@@ -2,8 +2,10 @@
 
 This is a native-Windows port of openWebBuddy. The original project is Debian-family
 Linux only (it uses `apt`, a systemd Ollama service, Docker with `--network host`, and
-Linux networking commands). This port keeps the same architecture and the same 16
-diagnostic tools, but runs everything natively on Windows with no WSL and no Docker.
+Linux networking commands). This port keeps the same architecture and the 16 diagnostic
+tools, but runs everything natively on Windows with no WSL and no Docker. It also adds a
+second, optional tool category - **net-vuln**: 5 nmap-powered security-assessment tools
+(see "Security tools (net-vuln)" below).
 
 ## What replaces what
 
@@ -18,15 +20,31 @@ Ollama and mcpo stay on `127.0.0.1`; OpenWebUI is bound to `127.0.0.1` too (the 
 version exposes `:3000` on all interfaces — this port keeps it on loopback by default;
 set `OWUI_PORT` and edit the host in the launcher if you want LAN access).
 
-## Prerequisites (already installed by the setup that produced this port)
+## Prerequisites
+
+The fastest path is **`setup.ps1`**, the Windows preflight checker/installer (the analog of
+the Linux `setup`). It reports what is present and installs what is missing:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Check   # report only, change nothing
+powershell -ExecutionPolicy Bypass -File .\setup.ps1          # create the venv, pull the model, etc.
+```
+
+It checks: Python >= 3.10, the `net-mcp\.venv` venv (`open-webui mcp mcpo ollama`), Ollama +
+the `.env` model, the Visual C++ runtime OpenWebUI/PyTorch needs, and - for the optional
+net-vuln tools - nmap and the Npcap driver. It auto-installs the venv, model, and VC++
+runtime via winget/pip; nmap/Npcap it only reports on (their installer is interactive).
+
+What it provisions, for reference:
 
 - Python 3.11 (`winget install Python.Python.3.11`)
 - Ollama for Windows (`winget install Ollama.Ollama`) + `ollama pull qwen2.5:7b-instruct`
   (the recommended agentic model; `llama3.2:1b` works as a small fallback but is too weak
   to chain tools reliably)
 - A venv at `net-mcp\.venv` with `open-webui mcp mcpo ollama` installed
+- The VC++ 2015-2022 x64 runtime (`winget install Microsoft.VCRedist.2015+.x64`)
 
-To recreate the venv from scratch:
+To recreate just the venv by hand:
 
 ```powershell
 & "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe" -m venv net-mcp\.venv
@@ -37,7 +55,7 @@ net-mcp\.venv\Scripts\python.exe -m pip install open-webui mcp mcpo ollama
 
 ```powershell
 # from the repo root
-.\openWebBuddy.ps1            # start Ollama + OpenWebUI + net-diag tools, open the browser
+.\openWebBuddy.ps1            # start Ollama + OpenWebUI + net-diag/net-vuln tools, open the browser
 .\openWebBuddy.ps1 status     # show what's running
 .\openWebBuddy.ps1 stop       # stop OpenWebUI + tool bridge (Ollama is left running)
 .\openWebBuddy.ps1 restart
@@ -70,11 +88,11 @@ OpenWebUI starts with no accounts.
 Then chat: *"my internet is down"*, *"is my router OK?"*, *"why is wifi slow?"*
 
 Bootstrap is safe to re-run and **updates the model record in place** - re-run it whenever
-you change `MODEL` in `.env` or want to pick up a new system prompt. It registers the
-Net-Diag tool server, pins the tools to the model, enables native function calling,
-disables OpenWebUI's built-in tools (notes, web search, ...) so only the Net-Diag tools
-are offered to the model, sets the agentic system prompt, `num_ctx` (8192), temperature,
-prompt suggestions, and the workspace default model.
+you change `MODEL` in `.env` or want to pick up a new system prompt. It registers both the
+Net-Diag and Net-Vuln tool servers, pins both tool sets to the model, enables native
+function calling, disables OpenWebUI's built-in tools (notes, web search, ...) so only
+these tools are offered to the model, sets the agentic system prompt, `num_ctx` (8192),
+temperature, prompt suggestions, and the workspace default model.
 
 To configure a model other than the `.env` one (e.g. a fallback), pass it explicitly -
 note this also makes it the default model, so re-run for the main model last:
@@ -134,6 +152,49 @@ It picks the Windows server (`net_mcp_server_win.py`) automatically (override wi
 call and a preview of its result as the loop runs. Flags: `--model`, `--max-rounds`
 (default 12), `--num-ctx` (default 8192), `--temperature` (default 0.2).
 
+## Security tools (net-vuln)
+
+net-vuln is a second, optional tool category that sits alongside net-diag. Where net-diag
+answers "is my network working", net-vuln answers "what is exposed / is my network secure",
+assessed from this host against your own machine, LAN, and router. Its server is
+`net-vuln-mcp/net_vuln_server.py` (it reuses the `net-mcp\.venv` venv - it only needs
+`mcp`). One `mcpo` in config mode now serves both categories on the same port under path
+prefixes: `http://127.0.0.1:8000/net-diag` and `.../net-vuln`. Each is a separate,
+toggleable tool connection in OpenWebUI, and every tool inside it is individually
+toggleable.
+
+The 5 tools (all parse nmap XML into compact summaries; all bounded with `-T4` +
+`--host-timeout` + a subprocess timeout so a scan cannot hang the tool loop):
+
+- **`discover_lan`** (`nmap -sn`) - active LAN sweep; a real device inventory, stronger
+  than net-diag's `arp_scan_lan`.
+- **`scan_ports`** (`nmap -sS`, `-sT` fallback) - open / closed / **filtered** per port.
+- **`service_scan`** (`nmap -sV`) - service + version per open port.
+- **`grinch_scan`** (`nmap -sX`) - Xmas-scan firewall probe of the router (default target
+  the gateway). Cannot characterize Windows hosts (they answer "closed" to every port).
+- **`penny_special`** - a custom, read-only NSE banner grab (`net-vuln-mcp/scripts/
+  penny_special.nse`, categories `safe`/`discovery`) that flags known-risky services
+  (telnet, FTP, SMBv1, obsolete SSH/HTTP, exposed databases, ...).
+
+No intrusive/exploit/dos/brute NSE scripts are ever run, and scans stay on your own
+machine / LAN / router.
+
+### Installing nmap (required for net-vuln)
+
+The net-vuln tools shell out to `nmap`, which is **not** installed by the base setup. Until
+it is present each net-vuln tool returns a clear "nmap is not installed" message instead of
+a result (net-diag is unaffected). To enable them:
+
+1. Install nmap from <https://nmap.org/download.html> (its Windows installer bundles Npcap).
+2. During the Npcap step, **leave "Restrict Npcap driver's access to Administrators only"
+   UNCHECKED**. That lets the raw-packet scans (`-sS`, `-sX`) run without a UAC prompt each
+   session; administrator rights are then needed only once, at install time.
+3. Restart the tool bridge (`.\openWebBuddy.ps1 restart`) so a fresh scan picks up nmap.
+
+If Npcap is missing or was installed admin-only, `scan_ports` automatically falls back to
+an unprivileged connect scan (`-sT`, which cannot report "filtered"), and `grinch_scan`
+returns a message telling you to reinstall Npcap in non-admin mode.
+
 ## Notes / differences from the Linux version
 
 - **Wi-Fi signal** is reported by Windows as a quality percentage (via `netsh wlan`),
@@ -141,8 +202,10 @@ call and a preview of its result as the loop runs. Flags: `--model`, `--max-roun
 - **`arp_scan_lan`** uses the Windows ARP cache (`arp -a`); there is no `arp-scan`
   equivalent shipped, so it lists hosts this machine has recently contacted rather than
   actively sweeping the subnet.
-- **`port_scan` / `router_quick_audit`** use `nmap` if it is on `PATH`, otherwise fall
-  back to a built-in PowerShell TCP connect scan (capped at 256 ports for responsiveness).
+- **`port_scan` / `router_quick_audit`** (net-diag) use `nmap` if it is on `PATH`,
+  otherwise fall back to a built-in PowerShell TCP connect scan (capped at 256 ports for
+  responsiveness). For a real security assessment - including "filtered" vs "closed",
+  service versions, and firewall probing - use the net-vuln tools above instead.
 - **Tool outputs are summarized**, not raw command dumps: `ping`/`tracert`/`arp`/
   `netsh wlan`/`route print`/adapter statistics are parsed into a few compact lines
   (with a raw-output fallback if parsing fails), because a local model reasons far

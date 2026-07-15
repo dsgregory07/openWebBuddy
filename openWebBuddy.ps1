@@ -44,6 +44,8 @@ $Python      = Join-Path $VenvScripts 'python.exe'
 $Mcpo        = Join-Path $VenvScripts 'mcpo.exe'
 $OpenWebUI   = Join-Path $VenvScripts 'open-webui.exe'
 $Server      = Join-Path $McpDir 'net_mcp_server_win.py'
+# net-vuln (nmap security-assessment tools) shares the net-mcp venv - it only needs `mcp`.
+$VulnServer  = Join-Path (Join-Path $Root 'net-vuln-mcp') 'net_vuln_server.py'
 
 $LogDir      = Join-Path $Root 'logs'
 $DataDir     = Join-Path $Root 'owui-data'
@@ -116,38 +118,62 @@ function Start-Ollama {
 }
 
 # ---------------------------------------------------------------------------
-# Component: net-diag MCP bridge (mcpo -> OpenAPI tool server)
+# Component: MCP tool bridge (one mcpo, config mode -> two OpenAPI tool servers)
+#   /net-diag  = OS-command diagnostics (net_mcp_server_win.py)
+#   /net-vuln  = nmap security-assessment tools (net_vuln_server.py)
+# Both are stdio MCP servers mounted under path prefixes on the same port. The config
+# file is generated here (machine-specific absolute paths) into the gitignored logs dir.
 # ---------------------------------------------------------------------------
+function Write-McpoConfig {
+    # A Claude-desktop-style mcpServers map; each entry is one stdio command. The map key
+    # becomes the URL path prefix (mcpo mounts it at /<key>). net-vuln reuses net-diag's
+    # venv python, so it needs no separate environment.
+    $cfg = @{
+        mcpServers = @{
+            'net-diag' = @{ command = $Python; args = @($Server) }
+            'net-vuln' = @{ command = $Python; args = @($VulnServer) }
+        }
+    }
+    $path = Join-Path $LogDir 'mcpo.config.json'
+    ($cfg | ConvertTo-Json -Depth 6) | Out-File -FilePath $path -Encoding ascii -Force
+    return $path
+}
+
+function Get-ToolCount($SubPath) {
+    try {
+        $spec = (Invoke-WebRequest -Uri "http://127.0.0.1:$McpoPort/$SubPath/openapi.json" -UseBasicParsing -TimeoutSec 5).Content | ConvertFrom-Json
+        return ($spec.paths | Get-Member -MemberType NoteProperty).Count
+    } catch { return $null }
+}
+
 function Start-Mcpo {
-    Step "net-diag tool bridge (mcpo)"
-    if (Test-Http "http://127.0.0.1:$McpoPort/openapi.json") {
+    Step "MCP tool bridge (mcpo: net-diag + net-vuln)"
+    if (Test-Http "http://127.0.0.1:$McpoPort/net-diag/openapi.json") {
         Ok "already running on :$McpoPort"
         return
     }
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-    # 127.0.0.1, not 0.0.0.0: keep the diagnostic tools off the LAN - anyone who could
-    # reach this port could make the machine run pings/port scans, unauthenticated.
-    # The description needs embedded quotes: Start-Process joins -ArgumentList with spaces
-    # and does not re-quote elements, so without them mcpo receives only 'Offline'.
+    $configFile = Write-McpoConfig
+    # 127.0.0.1, not 0.0.0.0: keep the tools off the LAN - anyone who could reach this port
+    # could make the machine run pings/port/vuln scans, unauthenticated.
     $mcpoArgs = @(
         '--port', $McpoPort, '--host', '127.0.0.1',
-        '--name', 'net-diag',
-        '--description', '"Offline network diagnostic tools"',
-        '--', $Python, $Server
+        '--config', $configFile
     )
     $proc = Start-Process -FilePath $Mcpo -ArgumentList $mcpoArgs `
         -RedirectStandardOutput (Join-Path $LogDir 'mcpo.log') `
         -RedirectStandardError  (Join-Path $LogDir 'mcpo.err.log') `
         -WindowStyle Hidden -PassThru
     $proc.Id | Out-File -FilePath (Join-Path $LogDir 'mcpo.pid') -Encoding ascii -Force
-    if (-not (Wait-For { Test-Http "http://127.0.0.1:$McpoPort/openapi.json" } 25 $proc)) {
+    # net-diag is the critical set; its sub-app openapi.json 200s only once the stdio server
+    # has connected, so this doubles as a "tools actually loaded" check.
+    if (-not (Wait-For { Test-Http "http://127.0.0.1:$McpoPort/net-diag/openapi.json" } 30 $proc)) {
         Die "mcpo did not come up - see $LogDir\mcpo.err.log"
     }
-    try {
-        $spec = (Invoke-WebRequest -Uri "http://127.0.0.1:$McpoPort/openapi.json" -UseBasicParsing -TimeoutSec 5).Content | ConvertFrom-Json
-        $n = ($spec.paths | Get-Member -MemberType NoteProperty).Count
-        Ok "serving $n tools on :$McpoPort"
-    } catch { Ok "running on :$McpoPort" }
+    $diagN = Get-ToolCount 'net-diag'
+    $vulnN = Get-ToolCount 'net-vuln'
+    if ($null -ne $diagN) { Ok "net-diag: $diagN tools on :$McpoPort/net-diag" } else { Ok "net-diag running on :$McpoPort/net-diag" }
+    if ($null -ne $vulnN) { Ok "net-vuln: $vulnN tools on :$McpoPort/net-vuln" } else { Warn "net-vuln did not load - see $LogDir\mcpo.err.log" }
 }
 
 # ---------------------------------------------------------------------------
@@ -263,7 +289,7 @@ function Invoke-Start {
     Write-Host ""
     Write-Host "openWebBuddy is up." -ForegroundColor Green
     Write-Host "  Chat:   $OwuiUrl"
-    Write-Host "  Tools:  http://127.0.0.1:$McpoPort (net-diag OpenAPI server)"
+    Write-Host "  Tools:  http://127.0.0.1:$McpoPort/net-diag  and  /net-vuln (OpenAPI servers)"
     Write-Host "  Stop with: .\openWebBuddy.ps1 stop"
     $dbFile = Join-Path $DataDir 'webui.db'
     if (-not (Test-Path $dbFile)) {
@@ -294,9 +320,10 @@ function Invoke-StopAll {
 function Invoke-Status {
     Step "Status"
     $down = 0
-    if (Test-Http "$OllamaUrl/api/tags")                     { Ok "Ollama       running ($OllamaUrl)" }   else { Warn "Ollama       stopped"; $down = 1 }
-    if (Test-Http "$OwuiUrl/health")                          { Ok "OpenWebUI    running ($OwuiUrl)" }      else { Warn "OpenWebUI    stopped"; $down = 1 }
-    if (Test-Http "http://127.0.0.1:$McpoPort/openapi.json")  { Ok "net-diag MCP running (:$McpoPort)" }    else { Warn "net-diag MCP stopped"; $down = 1 }
+    if (Test-Http "$OllamaUrl/api/tags")                              { Ok "Ollama       running ($OllamaUrl)" }        else { Warn "Ollama       stopped"; $down = 1 }
+    if (Test-Http "$OwuiUrl/health")                                   { Ok "OpenWebUI    running ($OwuiUrl)" }           else { Warn "OpenWebUI    stopped"; $down = 1 }
+    if (Test-Http "http://127.0.0.1:$McpoPort/net-diag/openapi.json")  { Ok "net-diag MCP running (:$McpoPort/net-diag)" } else { Warn "net-diag MCP stopped"; $down = 1 }
+    if (Test-Http "http://127.0.0.1:$McpoPort/net-vuln/openapi.json")  { Ok "net-vuln MCP running (:$McpoPort/net-vuln)" } else { Warn "net-vuln MCP stopped (nmap tools)"; $down = 1 }
     exit $down
 }
 

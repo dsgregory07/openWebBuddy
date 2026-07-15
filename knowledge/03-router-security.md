@@ -1,9 +1,16 @@
 # Home router security and port reference
 
 Scope: interpreting `router_quick_audit` and `port_scan` results against a home router,
-and hardening it. The tools report OPEN ports only and cannot distinguish closed from
-filtered, so "not listed" means "not open among the ports scanned," never "confirmed
-closed."
+and hardening it. These two net-diag tools report OPEN ports only and cannot distinguish
+closed from filtered, so "not listed" means "not open among the ports scanned," never
+"confirmed closed."
+
+If the nmap-powered **net-vuln** tools are enabled (see "The net-vuln security tools"
+below), you have stronger options: `scan_ports` reports real open / closed / **filtered**
+states, `service_scan` names the service and version on each open port, `grinch_scan`
+probes the router firewall with an Xmas scan, and `discover_lan` actively inventories the
+LAN. Prefer them for a security assessment; keep `router_quick_audit`/`port_scan` for a
+quick open-port glance when net-vuln is toggled off.
 
 ## Common home-router ports and what an OPEN one means
 
@@ -12,7 +19,7 @@ closed."
 | 53   | DNS | Normal - the router runs a DNS relay/forwarder for the LAN. Expected. |
 | 80   | HTTP admin | The web admin page (unencrypted). Normal on the LAN side; must NOT be open on the WAN/internet side. |
 | 443  | HTTPS admin | The web admin page (encrypted). Normal on the LAN side. Preferred over 80. |
-| 8080 | Alt HTTP admin | Alternate admin/管理 port. Fine on LAN; risky if exposed to WAN. |
+| 8080 | Alt HTTP admin | Alternate admin port. Fine on LAN; risky if exposed to WAN. |
 | 8443 | Alt HTTPS admin | Alternate secure admin port. Fine on LAN. |
 | 22   | SSH | Some routers/OpenWrt. Fine if you set it up; investigate if you did not. |
 | 23   | Telnet | RISK. Unencrypted remote admin. Should be OFF. See below. |
@@ -64,5 +71,31 @@ set.
   WAN exposure has to be checked from outside or in the router's config.
 - Whether a service is patched. An open 443 admin page can still be running vulnerable
   firmware. Port state is not vulnerability state.
-- Closed vs filtered. A port "not open among those scanned" may be firewalled or simply not
-  listening; the connect scan cannot distinguish them.
+- Closed vs filtered. With net-diag's `port_scan`/`router_quick_audit` (a plain connect
+  scan), a port "not open among those scanned" may be firewalled or simply not listening -
+  it cannot distinguish them. The net-vuln `scan_ports` tool CAN: it reports "filtered"
+  (a firewall is silently dropping the port) separately from "closed" (nothing listening).
+
+## The net-vuln security tools (nmap)
+
+When the net-vuln category is enabled, these assess the network from this host's
+perspective. They need nmap installed (its Windows installer bundles Npcap); if nmap is
+missing they return a clear message instead of a result. Own machine / LAN / router only.
+
+- **`discover_lan`** - active LAN sweep (nmap -sn). A real inventory of live devices,
+  stronger than net-diag's `arp_scan_lan`, which only reads the passive ARP cache.
+- **`scan_ports`** - open / closed / **filtered** per port (nmap SYN scan, connect-scan
+  fallback if raw packets are unavailable). Report "filtered" and "closed" distinctly.
+- **`service_scan`** - service + version per open port (nmap -sV), e.g.
+  "80/tcp open http Apache 2.4.58". A version is NOT itself a vulnerability - do not claim
+  a CVE you have not verified; port/version state is not patch state.
+- **`grinch_scan`** - Xmas-scan firewall probe of the router (nmap -sX, default target the
+  gateway). It reveals ports a firewall silently drops. CAVEAT: it cannot characterize
+  Windows hosts - they answer "closed" to every port - so if every port is closed or the
+  target is Windows, the result is inconclusive; use `scan_ports`/`service_scan` instead.
+- **`penny_special`** - a custom, read-only NSE banner grab that flags known-risky services
+  (telnet, FTP, SMB/SMBv1, obsolete SSH/HTTP, exposed databases, ...). It only reads
+  banners; absence of a flag is not proof of safety.
+
+None of these run intrusive/exploit/dos/brute NSE scripts, and they stay on your own
+machine, LAN, and router.

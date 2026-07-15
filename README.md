@@ -120,6 +120,12 @@ chats live in a Docker volume and are kept).
 `net-mcp/net_mcp_server.py`, then `./openWebBuddy restart`. It appears
 automatically under the Net-Diag Tools server in OpenWebUI.
 
+**Security tools (net-vuln), Windows port.** The native-Windows port adds a second,
+optional tool category: 5 nmap-powered security-assessment tools (LAN discovery, port/
+service scanning with real filtered-vs-closed states, an Xmas-scan firewall probe, and a
+read-only risky-service banner grab) served as their own toggleable **Net-Vuln Tools**
+connection. It needs nmap installed. See [WINDOWS.md](WINDOWS.md) for details and setup.
+
 ## The model
 
 Default is `llama3.2:1b` — small enough for snappy CPU-only replies on

@@ -69,15 +69,27 @@ Ok "signed in"
 
 $headers = @{ Authorization = "Bearer $token" }
 
-Step "Registering the Net-Diag tool server"
+Step "Registering the net-diag and net-vuln tool servers"
+# One mcpo in config mode serves both MCP servers under path prefixes on the same port:
+#   /net-diag = OS-command diagnostics, /net-vuln = nmap security-assessment tools.
+# Each is its own OpenWebUI tool connection (its own toggleable set). net-diag KEEPS
+# info.id "Server" so any existing model pin (toolIds "server:Server") survives the move
+# to the /net-diag path. This POST replaces the whole connections list, so both are here.
 $toolServer = @{
     TOOL_SERVER_CONNECTIONS = @(
         @{
-            url = "http://127.0.0.1:$McpoPort"; path = "openapi.json"; type = "openapi"
+            url = "http://127.0.0.1:$McpoPort/net-diag"; path = "openapi.json"; type = "openapi"
             auth_type = "bearer"; headers = $null; key = ""
             config = @{ enable = $true; function_name_filter_list = @(); access_grants = @() }
             spec_type = "url"; spec = ""
             info = @{ id = "Server"; name = "Net-Diag Tools"; description = "Offline network troubleshooting tools (gateway, ping, traceroute, DNS, ARP, port scan, router audit)" }
+        }
+        @{
+            url = "http://127.0.0.1:$McpoPort/net-vuln"; path = "openapi.json"; type = "openapi"
+            auth_type = "bearer"; headers = $null; key = ""
+            config = @{ enable = $true; function_name_filter_list = @(); access_grants = @() }
+            spec_type = "url"; spec = ""
+            info = @{ id = "NetVuln"; name = "Net-Vuln Tools"; description = "nmap security-assessment tools (LAN discovery, port/service scan, Xmas firewall probe, risky-service flags). Own network only." }
         }
     )
 }
@@ -85,8 +97,9 @@ try {
     $resp = Invoke-RestMethod -Uri "$OwuiUrl/api/v1/configs/tool_servers" -Method Post `
         -Headers $headers -ContentType 'application/json' `
         -Body ($toolServer | ConvertTo-Json -Depth 10)
-    Ok "tool server 'Server' -> http://127.0.0.1:$McpoPort"
-} catch { Die "could not register the tool server: $($_.Exception.Message)" }
+    Ok "tool server 'Server'  -> http://127.0.0.1:$McpoPort/net-diag"
+    Ok "tool server 'NetVuln' -> http://127.0.0.1:$McpoPort/net-vuln"
+} catch { Die "could not register the tool servers: $($_.Exception.Message)" }
 
 Step "Configuring model $Model for agentic troubleshooting"
 
@@ -117,7 +130,7 @@ Work outward and stop at the first layer that is actually broken:
 
 READING RESULTS ON THIS MACHINE
 - Ping: Windows counts "Destination host unreachable" replies as RECEIVED. If a ping summary shows loss=0% but also mentions unreachable, that ping FAILED. The tool flags this; do not overrule it.
-- port_scan and router_quick_audit report OPEN ports only (a TCP connect scan, capped at 256 ports per call). They cannot tell closed from filtered. Never report a port as "closed" or "filtered"; say it was "not open among the ports scanned".
+- net-diag's built-in port_scan and router_quick_audit report OPEN ports only (a TCP connect scan, capped at 256 ports per call). They cannot tell closed from filtered. For those two tools, never report a port as "closed" or "filtered"; say it was "not open among the ports scanned". (This caveat is specific to those two net-diag tools - the net-vuln nmap tools below CAN distinguish filtered from closed.)
 - arp_scan_lan reads the ARP cache, not an active sweep. It shows only devices this machine has recently talked to, so it is not an inventory of the LAN. Never present it as a complete device list.
 - wifi_status reports signal as a percentage on Windows, not dBm. Do not invent dBm.
 - Several tools end in a VERDICT line. Use it, and do not contradict it without evidence from another tool.
@@ -132,6 +145,16 @@ Precision is the whole point. Vague reporting has previously caused a missed ope
     (c) the tool did not run, timed out, or errored -> UNKNOWN
 - State your coverage. If a scan covered a limited range, say so: "scanned the 8 common management ports; others not checked". Never imply coverage you did not achieve.
 - Do not infer one result from another. If you did not scan port 8080, you do not know whether port 8080 is open.
+
+SECURITY ASSESSMENT - net-vuln tools (only when the net-vuln category is enabled)
+Use these for "is my network/router secure", "what is exposed", "assess my network" - NOT for connectivity troubleshooting (use net-diag for that). If a net-vuln tool is not in your tool list, the category is toggled OFF - do not call it or mention it.
+- discover_lan: actively enumerate live devices on the LAN; inventory what is on the network. Stronger than net-diag's arp_scan_lan (which only reads the passive ARP cache).
+- scan_ports: open / closed / FILTERED states. You CAN now distinguish "filtered" (firewalled/silently dropped) from "closed" (nothing listening) - report which, and do not collapse them.
+- service_scan: service + version per open port = the attack surface. A version string is NOT itself a vulnerability - never claim a CVE you did not verify.
+- grinch_scan: Xmas-scan firewall probe of the router (default target = the gateway). It uses RAW packets, so on a USB Wi-Fi adapter it can briefly drop the Wi-Fi connection - warn the user before running it, and prefer scan_ports/service_scan (connect scans) if a stable link matters. CAVEAT: it also cannot characterize Windows hosts - they answer "closed" to every port. If every port is closed or the target is Windows, SAY the result is inconclusive and use scan_ports/service_scan instead.
+- penny_special: flags known-risky services (telnet, FTP, SMBv1, old SSH/HTTP, ...) from banners. Report exactly what it flags; the absence of a flag is not proof of safety.
+KEEP SCANS LIGHT: nmap scans can be slow, so let the port range default to the light 'top-100' set. Only widen it (e.g. to '1-1024' or a full range) when the user explicitly asks for a thorough or full scan, and tell them it will take longer. Scan one target at a time.
+Same precision rules as always: exact ports/services/versions, echo tool results, keep open/closed/filtered/UNKNOWN distinct, own network/router only.
 
 OUTPUT
 Once you can name the failing component, stop calling tools and answer with exactly these sections:
@@ -160,7 +183,7 @@ $modelPayload = @{
             @{ title = @("Why is Wi-Fi slow?", "check signal and errors"); content = "My Wi-Fi feels slow - check the signal, link rates, and interface errors." }
             @{ title = @("Is DNS broken?", "test the resolvers"); content = "Websites will not load by name - check whether DNS is the problem." }
         )
-        tags = @(); toolIds = @("server:Server")
+        tags = @(); toolIds = @("server:Server", "server:NetVuln")
     }
     params = @{
         function_calling = "native"   # real multi-round tool calls via Ollama /api/chat
@@ -221,8 +244,10 @@ $fail = 0
 try {
     $m = Invoke-RestMethod -Uri "$OwuiUrl/api/v1/models/model?id=$Model" -Method Get -Headers $headers
     $toolIds = $m.meta.toolIds -join ','
-    if ($toolIds -match 'server:Server') { Ok "tools pinned to $Model (toolIds: $toolIds)" }
-    else { Write-Host "  x  tool pinning not confirmed (got: '$toolIds')" -ForegroundColor Red; $fail = 1 }
+    if ($toolIds -match 'server:Server')  { Ok "net-diag tools pinned to $Model (toolIds: $toolIds)" }
+    else { Write-Host "  x  net-diag pin not confirmed (got: '$toolIds')" -ForegroundColor Red; $fail = 1 }
+    if ($toolIds -match 'server:NetVuln') { Ok "net-vuln tools pinned to $Model" }
+    else { Write-Host "  x  net-vuln pin not confirmed (got: '$toolIds')" -ForegroundColor Red; $fail = 1 }
     if ($m.params.system -match 'DIAGNOSIS') { Ok "agentic system prompt set" }
     else { Write-Host "  x  system prompt not confirmed" -ForegroundColor Red; $fail = 1 }
     if ("$($m.params.function_calling)" -eq 'native') { Ok "native function calling enabled" }
