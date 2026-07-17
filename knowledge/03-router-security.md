@@ -84,8 +84,9 @@ When the net-vuln category is enabled, these assess the network from this host's
 perspective. They need nmap installed (its Windows installer bundles Npcap); if nmap is
 missing they return a clear message instead of a result. Own machine / LAN / router only.
 
-- **`discover_lan`** - active LAN sweep (nmap -sn). A real inventory of live devices,
-  stronger than net-diag's `arp_scan_lan`, which only reads the passive ARP cache.
+- **`discover_lan`** - active LAN sweep (nmap -sn). A real inventory of live devices. For
+  WHAT a device is (not just its IP), prefer net-diag's `dev_disco` - it adds SSDP/vendor
+  identity that this tool does not.
 - **`scan_ports`** - open / closed / **filtered** per port (nmap SYN scan, connect-scan
   fallback if raw packets are unavailable). Report "filtered" and "closed" distinctly.
 - **`service_scan`** - service + version per open port (nmap -sV), e.g.

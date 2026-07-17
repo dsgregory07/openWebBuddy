@@ -39,6 +39,17 @@ DISCO_SSDP_TIMEOUT = env_int("NETDIAG_DISCO_SSDP_TIMEOUT", 3)  # seconds to wait
 DISCO_SSDP_FETCH_TIMEOUT = env_int("NETDIAG_DISCO_SSDP_FETCH_TIMEOUT", 2)  # per-device description fetch (s)
 
 
+def _dns_resolve_snippet(name: str, record_type: str = "A", server: str = "") -> str:
+    """Build the common '$a = Resolve-DnsName ...' fragment shared by dns_lookup,
+    check_internet, and dns_server_check - the only thing that differs between them is
+    what they do with $a afterward, which each caller appends itself."""
+    server_arg = f" -Server '{ps_quote(server)}'" if server else ""
+    return (
+        f"$a = Resolve-DnsName -Name '{ps_quote(name)}' -Type {record_type}"
+        f"{server_arg} -ErrorAction SilentlyContinue"
+    )
+
+
 def _fmt_bytes(n: int) -> str:
     x = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -289,16 +300,15 @@ def dns_lookup(hostname: str) -> str:
     hostname = hostname.strip()
     if not re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", hostname):
         out = run_ps(
-            f"$a = Resolve-DnsName -Name '{ps_quote(hostname)}' -Type A -ErrorAction SilentlyContinue |"
-            " Where-Object {$_.IPAddress};"
+            _dns_resolve_snippet(hostname) +
+            " | Where-Object {$_.IPAddress};"
             " if ($a) { $a.IPAddress -join \"`n\" } else { 'no A record / lookup failed' }"
         )
         return out or "no A record / lookup failed"
     # IP given: try reverse DNS first, then NetBIOS.
-    ip = ps_quote(hostname)
     ptr = run_ps(
-        f"$a = Resolve-DnsName -Name '{ip}' -Type PTR -ErrorAction SilentlyContinue;"
-        " if ($a) { ($a | Select-Object -First 1).NameHost }"
+        _dns_resolve_snippet(hostname, record_type="PTR") +
+        "; if ($a) { ($a | Select-Object -First 1).NameHost }"
     ).strip()
     if ptr and not ptr.startswith("error:") and not ptr.startswith("[exit"):
         return f"{hostname} -> {ptr} (reverse DNS)"
@@ -597,8 +607,8 @@ def check_internet() -> str:
     results.append(f"Ping 1.1.1.1 (raw IP): {m.group(0) if m else ip_ping}")
 
     dns = run_ps(
-        "$a = Resolve-DnsName -Name 'google.com' -Type A -ErrorAction SilentlyContinue |"
-        " Where-Object {$_.IPAddress} | Select-Object -First 1;"
+        _dns_resolve_snippet("google.com") +
+        " | Where-Object {$_.IPAddress} | Select-Object -First 1;"
         " if ($a) { $a.IPAddress }"
     )
     dns_ok = bool(re.search(r"^\d+\.\d+\.\d+\.\d+", dns, re.M))
@@ -664,12 +674,11 @@ def wifi_status() -> str:
 def dns_server_check(hostname: str = "google.com", server: str = "") -> str:
     """Test DNS resolution against a specific DNS server (e.g. the router, 1.1.1.1, or 8.8.8.8). Leave `server` empty to test the system default. Comparing the router's DNS vs a public one isolates whether the router's DNS relay is the problem."""
     hn = ps_quote(hostname)
-    server_arg = f" -Server '{ps_quote(server)}'" if server else ""
     server_label = ps_quote(server if server else "(system default)")
     script = (
         "$sw = [System.Diagnostics.Stopwatch]::StartNew();"
-        f" $a = Resolve-DnsName -Name '{hn}' -Type A{server_arg} -ErrorAction SilentlyContinue |"
-        " Where-Object {$_.IPAddress};"
+        + _dns_resolve_snippet(hostname, server=server) +
+        " | Where-Object {$_.IPAddress};"
         " $sw.Stop();"
         " if ($a) {"
         f"   'Server: {server_label}';"

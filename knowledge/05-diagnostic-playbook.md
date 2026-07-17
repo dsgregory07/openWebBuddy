@@ -53,9 +53,12 @@ Result patterns:
 
 ## "Is something on my network I don't recognize?"
 
-Chain: arp_scan_lan. Remember this is the ARP CACHE, not a sweep - it lists only devices
-this PC has recently exchanged traffic with, so absence proves nothing. For a real
-inventory the user needs to check the router's DHCP client list.
+Chain: dev_disco (leave `host` empty for a full sweep). It actively pings the subnet rather
+than reading a passive cache, and layers in identity: an SSDP/UPnP match is a CONFIRMED
+device name/manufacturer/model; a MAC-vendor match is a hint only, not proof; "identity
+unknown" means neither channel caught it, not that the device is absent - some devices
+never self-announce. Pass a specific IP to dev_disco to focus identification on just that
+one device once you have found it in the sweep.
 
 ## "My local service/server isn't working"
 

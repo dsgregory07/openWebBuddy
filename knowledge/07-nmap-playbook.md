@@ -86,19 +86,19 @@ Question: "Do I have anything old or insecure listening - telnet, FTP, SMBv1, VN
 
 Question: "Is my router's firewall actually dropping ports, or just refusing them?"
 
-- Run `grinch_scan` with no argument to target the default gateway (router). The Xmas scan
-  (`-sX`) separates **closed** (host sent a RST - actively refusing) from **open|filtered**
-  (silence - either listening or silently dropped).
-- CRITICAL - do not run this at a Windows host. Windows RSTs every port, so `-sX` reports ALL
-  ports "closed" and the result is meaningless. The tool flags this as INCONCLUSIVE; when you
-  see it, say so and switch to `scan_ports`/`service_scan`. Xmas is only meaningful against
-  Linux/BSD/embedded targets, which is most routers.
-- Two preconditions the tool enforces for you:
-  - It needs raw packets (the Npcap driver RUNNING). If the driver is down, the tool REFUSES
-    up front with a reboot message and never touches the network adapter - it does not even
-    try nmap.
-  - Raw scans on a USB Wi-Fi adapter can briefly drop the Wi-Fi link. Warn the user before
-    running it; if a stable connection matters, prefer the connect-based tools instead.
+- Run `grinch_scan` with no argument to target the default gateway (router). It picks its
+  mode automatically - no precondition to check yourself:
+  - **Raw-capable (wired, Npcap driver running):** a true Xmas scan (`-sX`), separating
+    **closed** (host sent a RST - actively refusing) from **open|filtered** (silence -
+    either listening or silently dropped).
+  - **Wi-Fi, or raw unavailable:** falls back automatically to a connect-based probe
+    (`-sT --reason`), which gives a full three-way **open** / **filtered** (silently
+    dropped) / **closed** (actively refused) split instead - and never touches the adapter
+    at the raw layer, so it cannot disrupt a Wi-Fi link.
+- CRITICAL - the Xmas (raw) mode is meaningless against a Windows host: Windows RSTs every
+  port, so it reports ALL ports "closed". The tool flags this as INCONCLUSIVE; when you see
+  it, say so and switch to `scan_ports`/`service_scan`. The connect-mode fallback does not
+  have this limitation - it still gives a valid open/filtered/closed read on a Windows target.
 
 ## Chaining the recipes
 
@@ -210,13 +210,19 @@ Each tool returns compact text lines. Parse them like this:
   "filtered" as unavailable - closed and filtered are indistinguishable in that mode.
 - **service_scan**: `port/proto open  <name product version (extrainfo)>` per open port. The
   product/version is the inventory value; the closing summary reminds you a version is not a CVE.
-- **penny_special**: `port/proto  service: RISK: <note> (banner: ...)` for a flag,
-  `port/proto  service: banner: <text>` for context only, or `... no risk flag`. The count in
-  the tail includes only `RISK:` lines.
-- **grinch_scan**: `port/proto  state  service` where state is `open|filtered` or `closed`,
-  then `Summary: A open|filtered, B closed.` If it says INCONCLUSIVE (every port closed), the
-  target RST-answered everything (Windows-like) and the Xmas scan told you nothing - fall back
-  to scan_ports/service_scan.
+- **penny_special**: a header, then an optional `OS guess: <name> (N% match)` line (wired
+  only), then per open port `{port}/{proto} open  <service label>` followed by an indented
+  `[<script_id>] <output>` line for each nmap script that fired on that port (nmap's own
+  `default`/`vuln` families and the curated `penny_special` flagger together, not just
+  banners). Host-level findings appear as `[host <script_id>] <output>`. The closing count
+  covers anything matching known vuln language (`vulnerable`, `cve-`, etc.) or a `penny_special`
+  `RISK:` note - treat every counted item as a LEAD to verify, never a confirmed vuln.
+- **grinch_scan**: shape depends on which mode ran (stated in the header). Xmas mode:
+  `port/proto  state  service` where state is `open|filtered` or `closed`, then
+  `Summary: A open|filtered, B closed.` - INCONCLUSIVE means the target RST-answered every
+  port (Windows-like) and Xmas told you nothing; fall back to scan_ports/service_scan.
+  Connect mode (Wi-Fi): `port/proto  state  service  (reason)` with state `open`/`filtered`/
+  `closed`, then `Summary: A open, B filtered (silently dropped), C closed (actively refused).`
 
 Cross-cutting result rules:
 - A tool line beginning `error:` or containing an nmap `did not complete` / raw-socket /

@@ -30,7 +30,7 @@ import xml.etree.ElementTree as ET
 # Shared helpers + tunable config live at the repo root; both MCP servers import them.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from net_common import (  # noqa: E402
-    run, run_ps, default_gateway, local_ipv4, local_subnet_24, env_int,
+    run, run_ps, default_gateway, local_subnet_24, env_int,
 )
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402

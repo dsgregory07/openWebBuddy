@@ -11,7 +11,10 @@
     Safe to re-run: if the model record already exists it is UPDATED in place, so re-run
     this after changing MODEL in .env or after pulling a new model. It pins the Net-Diag
     tools, enables native function calling, and sets the agentic system prompt, context
-    size, and prompt suggestions on the model.
+    size, and prompt suggestions on the model. The update API replaces the model's meta
+    block wholesale, so this script fetches the existing record first and carries forward
+    any Knowledge collections / tags attached via the OpenWebUI UI - otherwise a re-run
+    would silently detach them.
 #>
 [CmdletBinding()]
 param(
@@ -72,6 +75,19 @@ if (-not $token) { Die "sign-in failed - check the email and password" }
 Ok "signed in"
 
 $headers = @{ Authorization = "Bearer $token" }
+
+Step "Checking for an existing model record"
+# Fetched now (before building the payload below) so its meta can be carried forward -
+# /models/model/update replaces the whole meta block, so anything not explicitly preserved
+# here (Knowledge collections, tags attached via the UI) would otherwise be silently wiped
+# on every re-run.
+$existingMeta = $null
+$exists = $false
+try {
+    $mExisting = Invoke-RestMethod -Uri "$OwuiUrl/api/v1/models/model?id=$Model" -Method Get -Headers $headers
+    if ($mExisting -and $mExisting.id) { $exists = $true; $existingMeta = $mExisting.meta }
+} catch {}
+if ($exists) { Ok "found - will update in place" } else { Ok "not found - will create" }
 
 Step "Registering the net-diag and net-vuln tool servers"
 # One mcpo in config mode serves both MCP servers under path prefixes on the same port:
@@ -204,19 +220,22 @@ $modelPayload = @{
     }
     access_grants = @(); is_active = $true
 }
+# Carry forward Knowledge/tags from the existing record (see the note at the top of this
+# file) - fields this script does not itself manage, so they must be copied in explicitly
+# or the wholesale meta replace below would detach them.
+if ($existingMeta) {
+    if ($existingMeta.knowledge) { $modelPayload.meta.knowledge = @($existingMeta.knowledge) }
+    if ($existingMeta.tags -and @($existingMeta.tags).Count -gt 0) { $modelPayload.meta.tags = @($existingMeta.tags) }
+}
 $modelBody = $modelPayload | ConvertTo-Json -Depth 10
 
 # Update in place when the record exists so re-runs pick up prompt/param changes.
-$exists = $false
-try {
-    $m = Invoke-RestMethod -Uri "$OwuiUrl/api/v1/models/model?id=$Model" -Method Get -Headers $headers
-    if ($m -and $m.id) { $exists = $true }
-} catch {}
 try {
     if ($exists) {
         Invoke-RestMethod -Uri "$OwuiUrl/api/v1/models/model/update" -Method Post `
             -Headers $headers -ContentType 'application/json' -Body $modelBody | Out-Null
-        Ok "model record updated (tools, native function calling, agentic prompt, num_ctx)"
+        $kept = if ($modelPayload.meta.knowledge) { "$(@($modelPayload.meta.knowledge).Count) Knowledge file(s) kept" } else { "no Knowledge attached" }
+        Ok "model record updated (tools, native function calling, agentic prompt, num_ctx, $kept)"
     } else {
         Invoke-RestMethod -Uri "$OwuiUrl/api/v1/models/create" -Method Post `
             -Headers $headers -ContentType 'application/json' -Body $modelBody | Out-Null
