@@ -12,52 +12,56 @@ clear message and never a crash or a silently-wrong answer. Scans are bounded (-
 tool loop. Same code style as net_mcp_server_win.py: compact summaries, raw passthrough on
 parse failure so no information is lost.
 
-SAFETY: own machine / LAN / router only. No NSE external/intrusive/exploit/dos/brute/fuzzer
-scripts are ever run - only the bundled version detection and the curated, read-only
-penny_special banner grab (categories safe/discovery).
+SAFETY: intended for systems you own or are explicitly authorized to test. The tools run
+nmap's own version/OS detection and its 'default'/'vuln' NSE scripts (which FIND known
+issues, read-only) plus the curated penny_special banner flagger. They never run
+'dos'/'exploit'/'brute' scripts - this is assessment, not attack. Every scan is bounded
+(-T4 + --host-timeout + --script-timeout + a subprocess ceiling) so it cannot hang the
+tool loop. Raw-packet modes (-sX, -O, -A) are used only on a wired link; on Wi-Fi, where
+raw injection is impossible, each tool drops to a connect-based path automatically.
 """
 import os
 import re
 import shutil
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 
-from mcp.server.fastmcp import FastMCP
+# Shared helpers + tunable config live at the repo root; both MCP servers import them.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from net_common import (  # noqa: E402
+    run, run_ps, default_gateway, local_ipv4, local_subnet_24, env_int,
+)
+
+from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 mcp = FastMCP("net-vuln")
 
-TIMEOUT = 15
 # Scripts (custom NSE) live next to this file.
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 PENNY_NSE = os.path.join(SCRIPTS_DIR, "penny_special.nse")
 
-
-def run(cmd: list[str], timeout: int = TIMEOUT) -> str:
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, errors="replace", timeout=timeout
-        )
-        out = (proc.stdout or "").strip()
-        err = (proc.stderr or "").strip()
-        if proc.returncode != 0 and not out:
-            return f"[exit {proc.returncode}] {err or 'no output'}"
-        return out + (f"\n[stderr] {err}" if err else "")
-    except FileNotFoundError:
-        return f"error: '{cmd[0]}' is not installed"
-    except subprocess.TimeoutExpired:
-        return f"error: command timed out after {timeout}s"
-
-
-def run_ps(script: str, timeout: int = 30) -> str:
-    """Run a PowerShell snippet, forcing UTF-8 output so parsing is stable.
-
-    Higher default timeout than TIMEOUT: powershell.exe startup alone can take >10s when
-    a local model is saturating the CPU during inference.
-    """
-    full = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;" + script
-    return run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", full], timeout=timeout
-    )
+# --- Tunable knobs (env-overridable; defaults preserve the previous hardcoded values).
+# *_HOST_TIMEOUT is nmap's per-target cap (seconds); *_TIMEOUT is the subprocess ceiling
+# that stops a scan from ever hanging the tool loop. Raise these on a slow link. ---
+DISCOVER_HOST_TIMEOUT = env_int("NETVULN_DISCOVER_HOST_TIMEOUT", 30)
+DISCOVER_TIMEOUT = env_int("NETVULN_DISCOVER_TIMEOUT", 150)
+SCAN_HOST_TIMEOUT = env_int("NETVULN_SCAN_HOST_TIMEOUT", 120)
+SCAN_TIMEOUT = env_int("NETVULN_SCAN_TIMEOUT", 150)
+SCAN_MAX_RETRIES = env_int("NETVULN_SCAN_MAX_RETRIES", 2)
+SERVICE_HOST_TIMEOUT = env_int("NETVULN_SERVICE_HOST_TIMEOUT", 90)
+SERVICE_TIMEOUT = env_int("NETVULN_SERVICE_TIMEOUT", 120)
+SERVICE_MAX_RETRIES = env_int("NETVULN_SERVICE_MAX_RETRIES", 1)
+SERVICE_VERSION_INTENSITY = env_int("NETVULN_VERSION_INTENSITY", 2)
+GRINCH_HOST_TIMEOUT = env_int("NETVULN_GRINCH_HOST_TIMEOUT", 90)
+GRINCH_TIMEOUT = env_int("NETVULN_GRINCH_TIMEOUT", 120)
+GRINCH_MAX_RETRIES = env_int("NETVULN_GRINCH_MAX_RETRIES", 2)
+PENNY_TOP_PORTS = env_int("NETVULN_PENNY_TOP_PORTS", 50)  # default port breadth (snappy)
+PENNY_INV_HOST_TIMEOUT = env_int("NETVULN_PENNY_INV_HOST_TIMEOUT", 60)  # phase 1 per-host cap (s)
+PENNY_INV_TIMEOUT = env_int("NETVULN_PENNY_INV_TIMEOUT", 90)  # phase 1 subprocess cap
+PENNY_SCRIPT_HOST_TIMEOUT = env_int("NETVULN_PENNY_SCRIPT_HOST_TIMEOUT", 120)  # phase 2 per-host cap
+PENNY_TIMEOUT = env_int("NETVULN_PENNY_TIMEOUT", 180)  # phase 2 subprocess cap
+PENNY_SCRIPT_TIMEOUT = env_int("NETVULN_PENNY_SCRIPT_TIMEOUT", 30)  # per-NSE-script cap (s)
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +111,23 @@ def _npcap_raw_ready() -> bool:
     return "running" in out.lower()
 
 
+def _active_iface_is_wifi() -> bool:
+    """True if the interface that owns the default route is Wi-Fi (Native 802.11).
+
+    Raw packet injection (ARP sweep, -sS, -sX, -O) does NOT work on a Wi-Fi NIC under Npcap:
+    the scan fails, and the failed injection can knock the adapter off Wi-Fi. So when the
+    active interface is wireless we report raw as unavailable and the tools use their
+    connect-based paths, which never touch the adapter at the raw layer.
+    """
+    out = run_ps(
+        "$c = Get-NetIPConfiguration -ErrorAction SilentlyContinue |"
+        " Where-Object { $_.IPv4DefaultGateway } | Select-Object -First 1;"
+        " if ($c) { (Get-NetAdapter -InterfaceIndex $c.InterfaceIndex"
+        " -ErrorAction SilentlyContinue).PhysicalMediaType }"
+    )
+    return "802.11" in out.lower()
+
+
 def _find_nmap() -> str | None:
     """Locate nmap.exe. The Windows installer does not always add nmap to PATH, so fall
     back to the standard install dirs - otherwise a background process (mcpo) that
@@ -129,13 +150,13 @@ def _find_nmap() -> str | None:
 
 
 def nmap_capabilities() -> dict:
-    """Return {present, version, raw, path}. Cached after the first call."""
+    """Return {present, version, raw, wifi, path}. Cached after the first call."""
     global _CAPS
     if _CAPS is not None:
         return _CAPS
     path = _find_nmap()
     if not path:
-        _CAPS = {"present": False, "version": None, "raw": False, "path": None}
+        _CAPS = {"present": False, "version": None, "raw": False, "wifi": False, "path": None}
         return _CAPS
     version = "unknown"
     try:
@@ -147,7 +168,12 @@ def nmap_capabilities() -> dict:
             version = m.group(1)
     except Exception:
         pass
-    _CAPS = {"present": True, "version": version, "raw": _npcap_raw_ready(), "path": path}
+    wifi = _active_iface_is_wifi()
+    # raw needs the Npcap driver AND a non-Wi-Fi active interface: raw injection does not work
+    # on a Native-802.11 adapter, so we report raw=False there and the tools use their
+    # connect-safe paths instead of firing a doomed (and Wi-Fi-dropping) raw scan.
+    raw = _npcap_raw_ready() and not wifi
+    _CAPS = {"present": True, "version": version, "raw": raw, "wifi": wifi, "path": path}
     return _CAPS
 
 
@@ -208,39 +234,6 @@ def _clean_host(host: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Local network context (gateway + subnet), reused from net-diag's approach
-# ---------------------------------------------------------------------------
-def default_gateway() -> str | None:
-    out = run_ps(
-        "$r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |"
-        " Sort-Object RouteMetric | Select-Object -First 1;"
-        " if ($r) { $r.NextHop }"
-    )
-    m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", out)
-    return m.group(1) if m else None
-
-
-def local_ipv4() -> str | None:
-    """The IPv4 address of the interface that owns the default route."""
-    out = run_ps(
-        "$c = Get-NetIPConfiguration -ErrorAction SilentlyContinue |"
-        " Where-Object { $_.IPv4DefaultGateway } | Select-Object -First 1;"
-        " if ($c) { ($c.IPv4Address | Select-Object -First 1).IPAddress }"
-    )
-    m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", out)
-    return m.group(1) if m else None
-
-
-def local_subnet_24() -> str | None:
-    """Derive the local /24 (e.g. 192.168.1.0/24) from this host's primary IPv4."""
-    ip = local_ipv4()
-    if not ip:
-        return None
-    a, b, c, _d = ip.split(".")
-    return f"{a}.{b}.{c}.0/24"
-
-
-# ---------------------------------------------------------------------------
 # nmap XML parsing helpers
 # ---------------------------------------------------------------------------
 def _parse_hosts(xml_text: str):
@@ -281,10 +274,21 @@ def _parse_hosts(xml_text: str):
         extraports = []
         for ep in h.findall("ports/extraports"):
             extraports.append((ep.get("state"), ep.get("count")))
+        # OS fingerprint (from -O / -A), best guess only.
+        osmatch = None
+        om = h.find("os/osmatch")
+        if om is not None:
+            osmatch = (om.get("name"), om.get("accuracy"))
+        # Host-level script output: some vuln/discovery NSE scripts attach here, not to a port.
+        hostscripts = [
+            (s.get("id"), s.get("output"))
+            for s in h.findall("hostscript/script")
+        ]
         hosts.append({
             "ip": ipv4 or ipv6, "mac": mac, "vendor": vendor,
             "hostname": hostname, "state": state,
             "ports": ports, "extraports": extraports,
+            "osmatch": osmatch, "hostscripts": hostscripts,
         })
     return hosts
 
@@ -305,7 +309,7 @@ def _svc_label(port: dict) -> str:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def discover_lan(subnet: str = "") -> str:
-    """Actively discover live devices on the local network with an nmap ping/ARP sweep (nmap -sn). Leave `subnet` empty to auto-scan this host's own /24 (e.g. 192.168.1.0/24), or pass a CIDR like '192.168.1.0/24'. Stronger than net-diag's arp_scan_lan, which only reads the passive ARP cache - this probes every address. Use to inventory what is actually on the network. Own LAN only."""
+    """Actively discover live devices on the local network with an nmap ping/ARP sweep (nmap -sn). Leave `subnet` empty to auto-scan this host's own /24 (e.g. 192.168.1.0/24), or pass a CIDR like '192.168.1.0/24'. This probes every address for a real inventory. For WHAT a device is (not just its IP), prefer net-diag's dev_disco - it adds SSDP/vendor identity that this tool does not. Systems you own or are authorized to test only."""
     caps = nmap_capabilities()
     if not caps["present"]:
         return _nmap_missing_msg()
@@ -314,7 +318,14 @@ def discover_lan(subnet: str = "") -> str:
         return "error: could not determine the local subnet (no IPv4 on the default-route interface). Pass a subnet like '192.168.1.0/24'."
     if target.startswith("-"):
         return "error: invalid subnet."
-    xml, err = _run_nmap(["-sn", "-T4", "--host-timeout", "30s", target], timeout=150)
+    # ARP sweep (-sn) needs raw packets. On Wi-Fi / no Npcap, --unprivileged makes nmap do a
+    # connect-based discovery instead: it works over Wi-Fi and never touches the raw layer.
+    if caps["raw"]:
+        disc, mode = ["-sn", "-T4", "--host-timeout", f"{DISCOVER_HOST_TIMEOUT}s"], "nmap -sn"
+    else:
+        disc = ["-sn", "--unprivileged", "-T4", "--host-timeout", f"{DISCOVER_HOST_TIMEOUT}s"]
+        mode = "nmap -sn --unprivileged, Wi-Fi-safe"
+    xml, err = _run_nmap(disc + [target], timeout=DISCOVER_TIMEOUT)
     if not xml:
         return err or "error: nmap returned no output."
     try:
@@ -327,8 +338,8 @@ def discover_lan(subnet: str = "") -> str:
         if nerr:
             hint = " (if you just installed Npcap, REBOOT so its driver loads)" if _raw_unavailable(nerr) else ""
             return f"LAN discovery on {target} did not complete: {nerr}{hint}"
-        return f"LAN discovery on {target} (nmap -sn): no live hosts responded."
-    lines = [f"LAN discovery on {target} (nmap -sn): {len(up)} host(s) up"]
+        return f"LAN discovery on {target} ({mode}): no live hosts responded."
+    lines = [f"LAN discovery on {target} ({mode}): {len(up)} host(s) up"]
     for h in up:
         name = f"  ({h['hostname']})" if h["hostname"] else ""
         mac = f"  {h['mac']}" if h["mac"] else ""
@@ -351,23 +362,23 @@ def scan_ports(host: str, ports: str = "top-100") -> str:
     if not caps["present"]:
         return _nmap_missing_msg()
     port_args = ["--top-ports", "100"] if ports.strip() == "top-100" else ["-p", ports]
-    base = port_args + ["-T4", "-Pn", "--host-timeout", "120s", "--max-retries", "2", host]
+    base = port_args + ["-T4", "-Pn", "--host-timeout", f"{SCAN_HOST_TIMEOUT}s", "--max-retries", str(SCAN_MAX_RETRIES), host]
 
     scan_type = "-sS"
     fallback_note = ""
     if caps["raw"]:
         # --send-ip: raw IP layer instead of raw ethernet - gentler on Wi-Fi adapters.
-        xml, err = _run_nmap(["-sS", "--send-ip"] + base, timeout=150)
+        xml, err = _run_nmap(["-sS", "--send-ip"] + base, timeout=SCAN_TIMEOUT)
         # nmap writes error-XML to stdout on a raw-socket failure, so check both the
         # stderr and the XML errormsg - not just whether stdout is empty.
         if _raw_unavailable(err, _nmap_error(xml)):
             scan_type = "-sT"
             fallback_note = " (SYN scan could not open a raw socket - is the Npcap driver running? - so used a connect scan -sT, which cannot report 'filtered')"
-            xml, err = _run_nmap(["-sT"] + base, timeout=150)
+            xml, err = _run_nmap(["-sT"] + base, timeout=SCAN_TIMEOUT)
     else:
         scan_type = "-sT"
         fallback_note = " (raw-packet scanning unavailable - Npcap driver not running; used an unprivileged connect scan -sT, which cannot report 'filtered'. This mode does not touch the Wi-Fi adapter at the raw layer.)"
-        xml, err = _run_nmap(["-sT"] + base, timeout=150)
+        xml, err = _run_nmap(["-sT"] + base, timeout=SCAN_TIMEOUT)
 
     if not xml:
         return err or "error: nmap returned no output."
@@ -406,7 +417,7 @@ def scan_ports(host: str, ports: str = "top-100") -> str:
 
 @mcp.tool()
 def service_scan(host: str, ports: str = "top-100") -> str:
-    """Identify the service and version running on each open TCP port (nmap -sV), e.g. '80/tcp open http Apache 2.4.58'. This turns open ports into an actual attack-surface inventory - the core of a host-perspective security assessment. Version detection is slow per port, so `ports` defaults to a LIGHT 'top-100' scan (keep it light) - only widen to '1-1024' etc. when the user asks for thorough. Other examples: '22,80,443'. A detected version is NOT itself a vulnerability; report it, do not invent CVEs. Own hosts/router only."""
+    """Identify the service and version running on each open TCP port (nmap -sV), e.g. '80/tcp open http Apache 2.4.58'. This turns open ports into an actual attack-surface inventory - the core of a host-perspective security assessment. Version detection is slow per port, so `ports` defaults to a LIGHT 'top-100' scan (keep it light) - only widen to '1-1024' etc. when the user asks for thorough. Other examples: '22,80,443'. A detected version is NOT itself a vulnerability; report it, do not invent CVEs. Systems you own or are authorized to test only."""
     host = _clean_host(host)
     if not host:
         return "error: no host given (or host looks like a flag)."
@@ -419,9 +430,9 @@ def service_scan(host: str, ports: str = "top-100") -> str:
     # --version-intensity 2 (light) keeps a single slow TLS/app probe from eating the whole
     # host-timeout; it still identifies the common services this tool cares about.
     xml, err = _run_nmap(
-        ["-sT", "-sV", "--version-intensity", "2"] + port_args
-        + ["-T4", "-Pn", "--host-timeout", "90s", "--max-retries", "1", host],
-        timeout=120,
+        ["-sT", "-sV", "--version-intensity", str(SERVICE_VERSION_INTENSITY)] + port_args
+        + ["-T4", "-Pn", "--host-timeout", f"{SERVICE_HOST_TIMEOUT}s", "--max-retries", str(SERVICE_MAX_RETRIES), host],
+        timeout=SERVICE_TIMEOUT,
     )
     if not xml:
         return err or "error: nmap returned no output."
@@ -455,41 +466,38 @@ def service_scan(host: str, ports: str = "top-100") -> str:
 
 @mcp.tool()
 def grinch_scan(host: str = "", ports: str = "top-100") -> str:
-    """Probe a firewall with an Xmas scan (nmap -sX) - the "grinch" scan. Leave `host` empty to target the default gateway (router). The Xmas scan sets the FIN/PSH/URG flags and distinguishes 'closed' (the host sent a RST - actively refusing) from 'open|filtered' (silence - either listening or silently dropped), revealing ports a firewall drops that a SYN/connect scan cannot show as cleanly. `ports` defaults to a LIGHT 'top-100' scan (keep it light); widen to '1-1024' etc. only when needed. Needs raw packets (Npcap). CRITICAL: the Xmas scan does NOT work against Windows hosts - Windows RSTs every port, so it reports ALL ports 'closed'. If the target is Windows or every port is closed, the scan is INCONCLUSIVE; say so and use scan_ports/service_scan instead. It is effective against Linux/BSD/embedded targets, i.e. most routers. Own router/hosts only. NOTE: this is a raw-packet scan; on a USB Wi-Fi adapter it can briefly drop the Wi-Fi link - warn the user before running it, and prefer scan_ports/service_scan if a stable connection matters."""
+    """Firewall / packet-filter assessment of a host - the "grinch" scan. Leave `host` empty to target the default gateway (router), or pass any host you own or are authorized to test. It maps which ports a firewall SILENTLY DROPS (filtered) vs ACTIVELY REFUSES (closed) vs allows (open). Two modes, chosen automatically: on a wired/raw-capable link it runs a true Xmas scan (nmap -sX, FIN/PSH/URG flags) which can slip past some stateless filters; on Wi-Fi - where raw packets are impossible - it runs a connect-based probe (nmap -sT --reason) that reads the same distinction from TCP reason codes (conn-refused = closed, no-response = filtered). `ports` defaults to a LIGHT 'top-100'; widen only when needed. CAVEAT: the Xmas mode cannot characterize Windows hosts (they RST every port -> all 'closed'); on a Windows target the connect mode still gives a valid closed/filtered read. Systems you own or are explicitly authorized to test only."""
     caps = nmap_capabilities()
     if not caps["present"]:
         return _nmap_missing_msg()
-    # Refuse BEFORE running nmap when raw is not ready: attempting -sX would open the network
-    # adapter for raw injection, which on a USB Wi-Fi adapter can drop the Wi-Fi link.
-    if not caps["raw"]:
-        return (
-            "grinch_scan: the Xmas scan needs raw-packet capture (the Npcap driver), which is "
-            "not currently available. If you just installed nmap/Npcap, REBOOT so the driver "
-            "loads (it is set to start at boot). Heads-up: on a USB Wi-Fi adapter a raw scan "
-            "can briefly drop the Wi-Fi connection. For a Wi-Fi-safe check use scan_ports or "
-            "service_scan (they use connect scans and do not touch the adapter at the raw layer)."
-        )
     target = _clean_host(host) if host.strip() else default_gateway()
     if not target:
         return "error: no host given and no default gateway found (not on a LAN?)."
     label = "gateway " if not host.strip() else ""
     port_args = ["--top-ports", "100"] if ports.strip() == "top-100" else ["-p", ports]
-    # --send-ip: send at the raw IP layer, not raw ethernet - gentler on Wi-Fi adapters that
-    # break when nmap injects raw ethernet frames.
-    xml, err = _run_nmap(
-        ["-sX", "-T4", "-Pn", "--send-ip"] + port_args + ["--host-timeout", "90s", "--max-retries", "2", target],
-        timeout=120,
-    )
-    # -sX needs raw packets. On failure nmap may write nothing, OR an error-XML to stdout,
-    # so check stderr AND the XML errormsg.
-    if _raw_unavailable(err, _nmap_error(xml)):
-        return (
-            f"grinch_scan ({label}{target}): the Xmas scan needs raw-packet capture, which "
-            "nmap could not get. If you just installed nmap/Npcap, REBOOT so the Npcap "
-            "driver loads (or start it as admin: 'net start npcap'). Also ensure Npcap was "
-            "installed with 'Restrict to Administrators only' UNCHECKED. For now use "
-            "scan_ports/service_scan (they work without raw packets)."
+
+    # Mode selection. raw (Ethernet) -> real Xmas scan. If raw fails at runtime (driver
+    # stopped since startup) or we are on Wi-Fi, fall back to a connect-based probe that
+    # never opens the adapter for raw injection.
+    xmas = False
+    xml = err = ""
+    if caps["raw"]:
+        xml, err = _run_nmap(
+            ["-sX", "-T4", "-Pn", "--send-ip"] + port_args
+            + ["--host-timeout", f"{GRINCH_HOST_TIMEOUT}s", "--max-retries", str(GRINCH_MAX_RETRIES), target],
+            timeout=GRINCH_TIMEOUT,
         )
+        if _raw_unavailable(err, _nmap_error(xml)):
+            xml = ""  # raw genuinely unavailable - use the connect probe instead
+        else:
+            xmas = True
+    if not xmas:
+        xml, err = _run_nmap(
+            ["-sT", "--reason", "-T4", "-Pn"] + port_args
+            + ["--host-timeout", f"{GRINCH_HOST_TIMEOUT}s", "--max-retries", str(GRINCH_MAX_RETRIES), target],
+            timeout=GRINCH_TIMEOUT,
+        )
+
     if not xml:
         return err or "error: nmap returned no output."
     try:
@@ -502,53 +510,95 @@ def grinch_scan(host: str = "", ports: str = "top-100") -> str:
             return f"grinch_scan ({label}{target}) did not complete: {nerr}"
         return f"grinch_scan ({label}{target}): host did not respond."
     h = hosts[0]
-    lines = [f"Xmas scan of {label}{target} (nmap -sX):"]
-    shown = [p for p in h["ports"] if p["state"] != "closed"]
-    if shown:
-        for p in shown:
+
+    if xmas:
+        lines = [f"Firewall probe of {label}{target} (nmap -sX Xmas scan):"]
+        for p in [p for p in h["ports"] if p["state"] != "closed"]:
             svc = f"  {p['name']}" if p["name"] else ""
-            pp = f"{p['portid']}/{p['protocol']}"
-            lines.append(f"  {pp:<8} {p['state']:<13}{svc}")
-    open_filt = sum(1 for p in h["ports"] if p["state"] in ("open|filtered", "open", "filtered"))
+            lines.append(f"  {p['portid']}/{p['protocol']:<4} {p['state']:<13}{svc}")
+        open_filt = sum(1 for p in h["ports"] if p["state"] in ("open|filtered", "open", "filtered"))
+        closed_n = sum(1 for p in h["ports"] if p["state"] == "closed")
+        for state, count in h["extraports"]:
+            c = int(count) if count and count.isdigit() else 0
+            if state == "closed":
+                closed_n += c
+            elif state in ("open|filtered", "filtered"):
+                open_filt += c
+        lines.append(f"Summary: {open_filt} open|filtered, {closed_n} closed.")
+        if open_filt == 0 and closed_n > 0:
+            lines.append(
+                "INCONCLUSIVE: every port answered 'closed' (RST) - the signature of a Windows "
+                "host (or one that rejects malformed packets). Xmas cannot characterize it; use "
+                "scan_ports / service_scan, or re-run against a Linux/embedded target."
+            )
+        else:
+            lines.append(
+                "'open|filtered' = silent (listening OR silently dropped by a firewall); "
+                "'closed' = actively refused (RST)."
+            )
+        return "\n".join(lines)
+
+    # Connect-based firewall map (Wi-Fi / no raw): -sT --reason distinguishes closed
+    # (conn-refused = RST) from filtered (no-response = silently dropped).
+    lines = [f"Firewall probe of {label}{target} (connect-based, nmap -sT --reason; Wi-Fi-safe, no raw packets):"]
+    for p in [p for p in h["ports"] if p["state"] != "closed"]:
+        svc = f"  {p['name']}" if p["name"] else ""
+        reason = f"  ({p['reason']})" if p["reason"] else ""
+        lines.append(f"  {p['portid']}/{p['protocol']:<4} {p['state']:<10}{svc}{reason}")
+    open_n = sum(1 for p in h["ports"] if p["state"] == "open")
+    filt_n = sum(1 for p in h["ports"] if p["state"] == "filtered")
     closed_n = sum(1 for p in h["ports"] if p["state"] == "closed")
     for state, count in h["extraports"]:
+        c = int(count) if count and count.isdigit() else 0
         if state == "closed":
-            closed_n += int(count) if count and count.isdigit() else 0
-        elif state in ("open|filtered", "filtered"):
-            open_filt += int(count) if count and count.isdigit() else 0
-    lines.append(f"Summary: {open_filt} open|filtered, {closed_n} closed.")
-    # The all-closed signature = a target that RSTs everything (Windows, or a host that
-    # rejects malformed packets). Xmas cannot characterize it; flag as inconclusive.
-    if open_filt == 0 and closed_n > 0:
+            closed_n += c
+        elif state == "filtered":
+            filt_n += c
+        elif state == "open":
+            open_n += c
+    lines.append(f"Summary: {open_n} open, {filt_n} filtered (silently dropped), {closed_n} closed (actively refused).")
+    if filt_n == 0:
         lines.append(
-            "INCONCLUSIVE: every port answered 'closed' (RST). This is exactly how Windows "
-            "hosts (and some others) respond to an Xmas scan, so it cannot characterize this "
-            "target. Use scan_ports / service_scan instead."
+            "No silently-dropped ports: this firewall REFUSES (RST) rather than drops. For the "
+            "raw Xmas technique (evades some stateless filters), use a wired connection."
         )
     else:
         lines.append(
-            "'open|filtered' means the port was silent (listening OR silently dropped by a "
-            "firewall); 'closed' means the host actively refused (RST)."
+            "'filtered' = firewall silently dropped the probe; 'closed' = actively refused (RST). "
+            "For the raw Xmas technique, use a wired connection."
         )
     return "\n".join(lines)
 
 
 @mcp.tool()
-def penny_special(host: str, ports: str = "top-100") -> str:
-    """Flag known-risky services on a host by grabbing each open TCP port's banner and matching it against a curated table (telnet, FTP, SMB/SMBv1, obsolete SSH/HTTP, VNC, etc.) - the custom 'penny_special' NSE script (categories safe, discovery; read-only, NOT an exploit). Runs an unprivileged connect scan (nmap -sT), so it works without Npcap. `ports` defaults to a LIGHT 'top-100' scan (keep it light); widen to '1-1024' or a specific list like '22,23,21,80,443' only when needed. Report exactly what it flags; the absence of a flag is NOT proof the host is safe. Own hosts/router only."""
+def penny_special(host: str, ports: str = "") -> str:
+    """Vulnerability assessment of a host: OS fingerprint, service versions, and nmap's read-only 'default' + 'vuln' NSE scripts (known-CVE / misconfig checks like http-vuln-*, smb-vuln-*, ssl-enum-ciphers, http-security-headers) plus the curated penny_special banner flagger. Two modes, chosen automatically: on a wired/raw-capable link it runs the full aggressive scan (OS detection + version + default + vuln scripts + traceroute); on Wi-Fi - where raw packets are impossible - it drops OS detection/traceroute and runs the connect-safe subset (nmap -sT -sV + default + vuln scripts). `ports` defaults to a SMALL top-50 set so the heavy scripts stay snappy - pass 'top-100' or a spec like '22,80,443' to widen. It never runs dos/exploit/brute scripts. A script finding is a LEAD to verify, NOT a confirmed exploitable vuln, and a version string alone is not a CVE. Systems you own or are explicitly authorized to test only."""
     host = _clean_host(host)
     if not host:
         return "error: no host given (or host looks like a flag)."
     caps = nmap_capabilities()
     if not caps["present"]:
         return _nmap_missing_msg()
-    if not os.path.exists(PENNY_NSE):
-        return f"error: penny_special NSE script not found at {PENNY_NSE}."
-    port_args = ["--top-ports", "100"] if ports.strip() == "top-100" else ["-p", ports]
+    spec = ports.strip()
+    if not spec or spec == "top-50":
+        port_args, ports_label = ["--top-ports", str(PENNY_TOP_PORTS)], f"top-{PENNY_TOP_PORTS}"
+    elif spec == "top-100":
+        port_args, ports_label = ["--top-ports", "100"], "top-100"
+    else:
+        port_args, ports_label = ["-p", spec], spec
+
+    # PHASE 1 - fast inventory (open ports + versions, plus OS/traceroute on a wired link),
+    # bounded short so it always returns. The slow vuln scripts run separately in phase 2, so
+    # a script that overruns never costs you the port/version/OS inventory.
+    if caps["raw"]:
+        inv = ["-sS", "-O", "-sV", "--version-intensity", str(SERVICE_VERSION_INTENSITY), "--traceroute"]
+        mode = "OS + version, then vuln scripts (full)"
+    else:
+        inv = ["-sT", "-sV", "--version-intensity", str(SERVICE_VERSION_INTENSITY)]
+        mode = "connect-safe: version, then vuln scripts (OS detect needs Ethernet)"
     xml, err = _run_nmap(
-        ["-sT", "-Pn", "-T4"] + port_args
-        + ["--host-timeout", "120s", "--script", PENNY_NSE, host],
-        timeout=150,
+        inv + port_args + ["-T4", "-Pn", "--host-timeout", f"{PENNY_INV_HOST_TIMEOUT}s", host],
+        timeout=PENNY_INV_TIMEOUT,
     )
     if not xml:
         return err or "error: nmap returned no output."
@@ -559,33 +609,81 @@ def penny_special(host: str, ports: str = "top-100") -> str:
     if not hosts:
         nerr = _nmap_error(xml)
         if nerr:
-            return f"penny_special scan of {host} did not complete: {nerr}"
-        return f"penny_special scan of {host}: host did not respond."
+            return f"Vulnerability assessment of {host} did not complete: {nerr}"
+        return f"Vulnerability assessment of {host}: host did not respond."
     h = hosts[0]
     open_ports = [p for p in h["ports"] if p["state"] == "open"]
-    lines = [f"Risky-service scan of {host} (penny_special NSE):"]
-    if not open_ports:
-        lines.append("  no open TCP ports found to inspect.")
-        return "\n".join(lines)
-    flagged = 0
-    for p in open_ports:
-        notes = [out.strip() for sid, out in p["scripts"] if sid == "penny_special" and out]
-        svc = p["name"] or "?"
-        pp = f"{p['portid']}/{p['protocol']}"
-        if notes:
-            joined = " | ".join(notes)
-            # Only "RISK:" notes are actual flags; a plain "banner:" line is just context.
-            if any(n.startswith("RISK:") for n in notes):
-                flagged += 1
-            lines.append(f"  {pp:<8} {svc}: {joined}")
+
+    # PHASE 2 - vuln scripts on the OPEN ports only (best-effort, bounded). Skipped when
+    # nothing is open. If it overruns its host-timeout, nmap discards the host, so we keep the
+    # phase-1 inventory and say the scripts did not finish rather than losing everything.
+    port_scripts, host_scripts, scripts_note = {}, [], ""
+    if open_ports:
+        openspec = ",".join(p["portid"] for p in open_ports)
+        scriptset = f"default,vuln,{PENNY_NSE}" if os.path.exists(PENNY_NSE) else "default,vuln"
+        sx, _serr = _run_nmap(
+            ["-sT", "-Pn", "-T4", "-p", openspec, "--script", scriptset,
+             "--script-timeout", f"{PENNY_SCRIPT_TIMEOUT}s",
+             "--host-timeout", f"{PENNY_SCRIPT_HOST_TIMEOUT}s", host],
+            timeout=PENNY_TIMEOUT,
+        )
+        try:
+            sh = _parse_hosts(sx) if sx else []
+        except ET.ParseError:
+            sh = []
+        if sh and not _nmap_error(sx):
+            for p in sh[0]["ports"]:
+                if p["scripts"]:
+                    port_scripts[p["portid"]] = p["scripts"]
+            host_scripts = sh[0].get("hostscripts", [])
         else:
-            lines.append(f"  {pp:<8} {svc}: no risk flag")
-    tail = (
-        f"{flagged} risky service(s) flagged."
-        if flagged
-        else "No known-risky services flagged."
+            scripts_note = (
+                f"  [vuln scripts did not finish within {PENNY_SCRIPT_HOST_TIMEOUT}s - the "
+                "inventory below is complete; narrow `ports` or raise "
+                "NETVULN_PENNY_SCRIPT_HOST_TIMEOUT for full script coverage]"
+            )
+
+    def _is_hit(sid: str, out: str) -> bool:
+        low = out.lower()
+        if sid.startswith("penny") and "RISK:" in out:
+            return True
+        return any(k in low for k in ("vulnerable", "cve-", "state: likely vulnerable"))
+
+    lines = [f"Vulnerability assessment of {host} (nmap {mode}, ports {ports_label}):"]
+    if h.get("osmatch"):
+        name, acc = h["osmatch"]
+        lines.append(f"  OS guess: {name} ({acc}% match)")
+    if scripts_note:
+        lines.append(scripts_note)
+    findings = 0
+    if not open_ports:
+        filt = sum(1 for p in h["ports"] if p["state"] == "filtered")
+        lines.append(f"  no open TCP ports among those scanned{f' ({filt} filtered)' if filt else ''}.")
+    for p in open_ports:
+        lines.append(f"  {p['portid']}/{p['protocol']:<4} open  {_svc_label(p) or (p['name'] or '?')}")
+        for sid, out in port_scripts.get(p["portid"], []):
+            if not out or out.lstrip().startswith("ERROR") or "Script execution failed" in out:
+                continue  # skip scripts that could not run - noise, not findings
+            if _is_hit(sid, out):
+                findings += 1
+            lines.append(f"       [{sid}] {' '.join(out.split())[:300]}")
+    for sid, out in host_scripts:
+        if not out or out.lstrip().startswith("ERROR") or "Script execution failed" in out:
+            continue
+        if _is_hit(sid, out):
+            findings += 1
+        lines.append(f"  [host {sid}] {' '.join(out.split())[:300]}")
+    lines.append(
+        f"{findings} potential finding(s) flagged - VERIFY each; an nmap script hit is a lead, "
+        "not a confirmed exploitable vuln, and a version alone is not a CVE."
+        if findings else
+        "No vuln-script findings flagged. Absence of a flag is not proof of safety."
     )
-    lines.append(tail + " Absence of a flag is not proof of safety.")
+    if not caps["raw"]:
+        lines.append(
+            "Connect-safe mode (Wi-Fi): OS detection and traceroute skipped - use a wired "
+            "connection for the full scan."
+        )
     return "\n".join(lines)
 
 

@@ -166,8 +166,8 @@ toggleable.
 The 5 tools (all parse nmap XML into compact summaries; all bounded with `-T4` +
 `--host-timeout` + a subprocess timeout so a scan cannot hang the tool loop):
 
-- **`discover_lan`** (`nmap -sn`) - active LAN sweep; a real device inventory, stronger
-  than net-diag's `arp_scan_lan`.
+- **`discover_lan`** (`nmap -sn`) - active LAN sweep; a real device inventory. For WHAT a
+  device is (not just its IP), prefer net-diag's `dev_disco` - it adds SSDP/vendor identity.
 - **`scan_ports`** (`nmap -sS`, `-sT` fallback) - open / closed / **filtered** per port.
 - **`service_scan`** (`nmap -sV`) - service + version per open port.
 - **`grinch_scan`** (`nmap -sX`) - Xmas-scan firewall probe of the router (default target
@@ -189,23 +189,43 @@ a result (net-diag is unaffected). To enable them:
 2. During the Npcap step, **leave "Restrict Npcap driver's access to Administrators only"
    UNCHECKED**. That lets the raw-packet scans (`-sS`, `-sX`) run without a UAC prompt each
    session; administrator rights are then needed only once, at install time.
-3. Restart the tool bridge (`.\openWebBuddy.ps1 restart`) so a fresh scan picks up nmap.
+3. **Reboot Windows** so the freshly installed Npcap driver loads - it is set to start at
+   boot, and until it is running the raw-packet scans (`-sS` used by `scan_ports` SYN mode,
+   and `-sX` used by `grinch_scan`) fail. The connect-based tools work without it. (Advanced:
+   instead of rebooting you can load it once as admin with `net start npcap`.)
+4. Restart the tool bridge (`.\openWebBuddy.ps1 restart`) so a fresh scan picks up nmap.
 
-If Npcap is missing or was installed admin-only, `scan_ports` automatically falls back to
-an unprivileged connect scan (`-sT`, which cannot report "filtered"), and `grinch_scan`
-returns a message telling you to reinstall Npcap in non-admin mode.
+If Npcap is missing, the driver has not loaded (no reboot yet), or it was installed
+admin-only, `scan_ports` automatically falls back to an unprivileged connect scan (`-sT`,
+which cannot report "filtered"), and `grinch_scan` returns a message telling you to reboot or
+reinstall Npcap in non-admin mode.
 
 ## Notes / differences from the Linux version
 
 - **Wi-Fi signal** is reported by Windows as a quality percentage (via `netsh wlan`),
   not dBm, so `wifi_status` grades it on a percentage scale.
-- **`arp_scan_lan`** uses the Windows ARP cache (`arp -a`); there is no `arp-scan`
-  equivalent shipped, so it lists hosts this machine has recently contacted rather than
-  actively sweeping the subnet.
-- **`port_scan` / `router_quick_audit`** (net-diag) use `nmap` if it is on `PATH`,
-  otherwise fall back to a built-in PowerShell TCP connect scan (capped at 256 ports for
-  responsiveness). For a real security assessment - including "filtered" vs "closed",
-  service versions, and firewall probing - use the net-vuln tools above instead.
+- **`dev_disco`** (net-diag, replaces the old `arp_scan_lan`) is an active device-discovery
+  and identity tool, not a passive ARP-cache read. Leave `host` empty to sweep the whole local
+  subnet, or pass an IP to identify one device. It layers three signals: an active ping sweep
+  (via .NET async `Ping`, so results reflect who is up right now); SSDP/UPnP (pure Python
+  `socket`+`urllib`, no nmap needed) for a CONFIRMED name/manufacturer/model from any device
+  that self-announces (routers, smart TVs, streaming boxes, speakers, some IoT); and a MAC
+  vendor lookup (from nmap's bundled OUI database, if nmap is installed) for everything else -
+  a hint from the manufacturer prefix, not a confirmed identity. A device that answers neither
+  channel is reported as "identity unknown", not absent (privacy-randomized MACs on phones/
+  laptops commonly defeat the vendor lookup).
+- **`port_scan` / `router_quick_audit`** (net-diag) run `nmap` as a connect scan (`-sT -Pn`)
+  if it is on `PATH`, otherwise fall back to a built-in PowerShell TCP connect scan. Both paths
+  are connect-based and Wi-Fi-safe - they never open the adapter for raw packets, so they
+  cannot drop a USB Wi-Fi link. `port_scan`'s `"top-100"` now scans the SAME 100 ports (nmap's
+  real top-100 by frequency, read from its bundled `nmap-services` data) and returns the same
+  output shape whether or not nmap is installed, with service names in both cases. For a real
+  security assessment - including "filtered" vs "closed", service versions, and firewall
+  probing - use the net-vuln tools above instead.
+- **`dns_lookup`** also accepts an IP (instead of a hostname) to resolve it back to a name:
+  reverse DNS first, then a NetBIOS name query if there is no PTR record. Neither channel
+  succeeding is a normal result on most home LANs (no local PTR zone; non-Windows/non-SMB
+  devices don't answer NetBIOS) - it does not mean the device is unreachable.
 - **Tool outputs are summarized**, not raw command dumps: `ping`/`tracert`/`arp`/
   `netsh wlan`/`route print`/adapter statistics are parsed into a few compact lines
   (with a raw-output fallback if parsing fails), because a local model reasons far

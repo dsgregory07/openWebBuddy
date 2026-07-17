@@ -1,9 +1,10 @@
 # Home router security and port reference
 
 Scope: interpreting `router_quick_audit` and `port_scan` results against a home router,
-and hardening it. These two net-diag tools report OPEN ports only and cannot distinguish
-closed from filtered, so "not listed" means "not open among the ports scanned," never
-"confirmed closed."
+and hardening it. These two net-diag tools focus on OPEN ports - when nmap is installed they
+run it as a connect scan (`nmap -sT`), otherwise a built-in connect scan capped at 256 ports.
+Either way, treat "not listed" as "not open among the ports scanned," never "confirmed
+closed"; for reliable closed-vs-filtered use the net-vuln `scan_ports` tool.
 
 If the nmap-powered **net-vuln** tools are enabled (see "The net-vuln security tools"
 below), you have stronger options: `scan_ports` reports real open / closed / **filtered**
@@ -71,10 +72,11 @@ set.
   WAN exposure has to be checked from outside or in the router's config.
 - Whether a service is patched. An open 443 admin page can still be running vulnerable
   firmware. Port state is not vulnerability state.
-- Closed vs filtered. With net-diag's `port_scan`/`router_quick_audit` (a plain connect
-  scan), a port "not open among those scanned" may be firewalled or simply not listening -
-  it cannot distinguish them. The net-vuln `scan_ports` tool CAN: it reports "filtered"
-  (a firewall is silently dropping the port) separately from "closed" (nothing listening).
+- Closed vs filtered. With net-diag's `port_scan`/`router_quick_audit` (a connect scan,
+  whether via `nmap -sT` or the built-in fallback), a port "not open among those scanned" may
+  be firewalled or simply not listening - it cannot distinguish them reliably. The net-vuln
+  `scan_ports` tool CAN: it reports "filtered" (a firewall is silently dropping the port)
+  separately from "closed" (nothing listening).
 
 ## The net-vuln security tools (nmap)
 
