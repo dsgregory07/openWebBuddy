@@ -3,8 +3,8 @@
 An **offline** LAN/router troubleshooting assistant that runs entirely on your
 own hardware. A local Ollama model (`llama3.2:1b`) chats through OpenWebUI and
 can call a set of network-diagnostic tools exposed by a small MCP server.
-No cloud, no API keys, no data leaving the machine — developed and tested on a
-Raspberry Pi 5.
+No cloud, no API keys, no data leaving the machine. So far I've developed and tested on the following platforms:
+Raspberry Pi 5 Raspian, Librem 14 PureOS, Windows 10.
 
 ## Quick start
 
